@@ -1,8 +1,8 @@
-use crate::runtime::{DefaultActorRuntime, Runtime};
+use crate::runtime::{ActorRuntime, Runtime};
+use flume::{SendError, Sender};
 use message::{Envelope, Message, MessagePacker, MessageRequest};
 use std::fmt::Debug;
-use tokio::sync::{mpsc::Sender, oneshot};
-
+use tokio::sync::oneshot;
 pub mod debug;
 pub mod message;
 pub mod runtime;
@@ -14,7 +14,7 @@ pub trait Actor {
         Self: Sized + Send + 'static,
     {
         println!("Starting actor");
-        DefaultActorRuntime::start(self)
+        ActorRuntime::run(self)
     }
 }
 
@@ -26,9 +26,21 @@ where
     command_tx: Sender<ActorCommand>,
 }
 
-impl<A> ActorHandle<A>
+impl<A> Clone for ActorHandle<A>
 where
     A: Actor,
+{
+    fn clone(&self) -> Self {
+        Self {
+            message_tx: self.message_tx.clone(),
+            command_tx: self.command_tx.clone(),
+        }
+    }
+}
+
+impl<A> ActorHandle<A>
+where
+    A: Actor + 'static,
 {
     pub async fn send_sync<M>(&self, message: M) -> Result<M::Response, Error>
     where
@@ -37,7 +49,9 @@ where
     {
         let (tx, rx) = oneshot::channel();
         let packed = A::pack(message, Some(tx));
-        self.message_tx.send(packed).await.unwrap(); // TODO
+        self.message_tx
+            .send(packed)
+            .map_err(Error::send_err_boxed)?;
         MessageRequest { response_rx: rx }.await
     }
 
@@ -47,12 +61,11 @@ where
         A: Handler<M> + MessagePacker<A, M> + 'static,
     {
         let packed = A::pack(message, None);
-        self.message_tx.send(packed).await.unwrap(); // TODO
-        Ok(())
+        self.message_tx.send(packed).map_err(Error::send_err_boxed)
     }
 
     pub async fn send_cmd(&self, cmd: ActorCommand) -> Result<(), Error> {
-        self.command_tx.send(cmd).await.unwrap(); // TODO
+        self.command_tx.send(cmd).unwrap();
         Ok(())
     }
 }
@@ -70,6 +83,16 @@ pub enum Error {
     ActorChannelClosed,
     #[error("Channel closed: {0}")]
     ChannelClosed(#[from] oneshot::error::TryRecvError),
+    #[error("Send error: {0}")]
+    Send(Box<dyn std::error::Error + Send + 'static>),
+    #[error("Warp error: {0}")]
+    Warp(#[from] warp::Error),
+}
+
+impl Error {
+    fn send_err_boxed<T: Send + 'static>(error: SendError<T>) -> Self {
+        Self::Send(Box::new(error))
+    }
 }
 
 #[derive(Debug)]
@@ -105,24 +128,30 @@ mod tests {
 
         impl Handler<Foo> for Testor {
             fn handle(&mut self, _: Foo) -> Result<usize, Error> {
+                println!("Handling Foo");
                 Ok(10)
             }
         }
 
         impl Handler<Bar> for Testor {
             fn handle(&mut self, _: Bar) -> Result<isize, Error> {
+                println!("Handling Bar");
                 Ok(10)
             }
         }
 
         let handle = Testor {}.start();
 
-        let res = handle.send_sync(Foo {}).await.unwrap();
-        let res2 = handle.send_sync(Bar {}).await.unwrap();
+        let mut res = 0;
+        let mut res2 = 0;
+        for _ in 0..100 {
+            res += handle.send_sync(Foo {}).await.unwrap();
+            res2 += handle.send_sync(Bar {}).await.unwrap();
+        }
 
         handle.send_cmd(ActorCommand::Stop).await.unwrap();
 
-        assert_eq!(res, 10);
-        assert_eq!(res2, 10);
+        assert_eq!(res, 1000);
+        assert_eq!(res2, 1000);
     }
 }

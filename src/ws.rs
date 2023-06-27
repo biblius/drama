@@ -1,10 +1,20 @@
+use std::{
+    collections::VecDeque,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
 use crate::{
     message::{Envelope, PackedMessage},
     runtime::Runtime,
-    Actor, ActorCommand, ActorHandle, Handler,
+    Actor, ActorCommand, ActorHandle, Error, Handler,
 };
-use futures::{SinkExt, StreamExt, TryFutureExt};
-use tokio::{select, sync::mpsc::Receiver};
+use flume::Receiver;
+use futures::{
+    stream::{SplitSink, SplitStream},
+    Future, SinkExt, StreamExt,
+};
+use pin_project::pin_project;
 use warp::ws::WebSocket;
 
 pub struct WebsocketActor {
@@ -17,7 +27,7 @@ impl Actor for WebsocketActor {
         Self: Sized + Send + 'static,
     {
         println!("Starting websocket actor");
-        WebsocketRuntime::start(self)
+        WebsocketRuntime::run(self)
     }
 }
 
@@ -29,82 +39,127 @@ impl WebsocketActor {
     }
 }
 
+#[pin_project]
 pub struct WebsocketRuntime {
     actor: WebsocketActor,
+
+    ws_stream: SplitStream<WebSocket>,
+    ws_sink: SplitSink<WebSocket, warp::ws::Message>,
+
     message_rx: Receiver<Envelope<WebsocketActor>>,
     command_rx: Receiver<ActorCommand>,
+
+    message_queue: VecDeque<Envelope<WebsocketActor>>,
+    ws_queue: VecDeque<warp::ws::Message>,
 }
 
 impl WebsocketRuntime {
     pub fn new(
-        actor: WebsocketActor,
+        mut actor: WebsocketActor,
         command_rx: Receiver<ActorCommand>,
         message_rx: Receiver<Envelope<WebsocketActor>>,
     ) -> Self {
-        Self {
-            actor,
-            message_rx,
-            command_rx,
-        }
-    }
-}
-
-impl WebsocketRuntime {
-    pub async fn run(mut self) {
-        let (mut ws_sender, mut ws_receiver) = self
-            .actor
+        let (ws_sink, ws_stream) = actor
             .websocket
             .take()
             .expect("Websocket runtime already started")
             .split();
 
+        Self {
+            actor,
+            ws_sink,
+            ws_stream,
+            message_rx,
+            command_rx,
+            message_queue: VecDeque::new(),
+            ws_queue: VecDeque::new(),
+        }
+    }
+}
+
+impl Future for WebsocketRuntime {
+    type Output = Result<(), Error>;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+
         loop {
-            select! {
-                // Handle any pending commands
-                Some(msg) = self.command_rx.recv() => {
-                    match msg {
-                        ActorCommand::Stop => {
-                            println!("Actor stopping");
-                            break;
-                        }
+            // Poll command receiver
+            match Pin::new(&mut this.command_rx.recv_async()).poll(cx) {
+                Poll::Ready(Ok(message)) => match message {
+                    ActorCommand::Stop => {
+                        println!("Actor stopping");
+                        break Poll::Ready(Ok(())); // TODO drain the queue and all that graceful stuff
                     }
+                },
+                Poll::Ready(Err(_)) => {
+                    println!("Command stream dropped, ungracefully stopping actor");
+                    break Poll::Ready(Err(Error::ActorChannelClosed));
                 }
-                // Handle any in-process messages
-                Some(mut message) = self.message_rx.recv() => {
-                    println!("Processing Message");
-                    message.handle(&mut self.actor)
-                }
-                // Handle any messages from the websocket
-                Some(message) = ws_receiver.next() => {
-                    match message {
-                        Ok(message) => {
-                            if let Some(res) = self.actor.handle(message).unwrap() {// TODO
-                                ws_sender.send(res)
-                                    .unwrap_or_else(|e| {
-                                        eprintln!("websocket send error: {}", e);
-                                    })
-                                    .await;
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!("WS error occurred {e}")
-                        },
+                Poll::Pending => {}
+            };
+
+            // Poll the websocket stream for any messages and store them to the queue
+            while let Poll::Ready(Some(ws_message)) = Pin::new(&mut this.ws_stream.next()).poll(cx)
+            {
+                match ws_message {
+                    Ok(message) => this.ws_queue.push_back(message),
+                    Err(e) => {
+                        eprintln!("WS error occurred {e}")
                     }
-                }
-                else => {
-                    println!("No messages")
                 }
             }
+
+            // Respond to any queued websocket messages
+            while let Some(ws_message) = this.ws_queue.pop_front() {
+                if let Some(res) = this.actor.handle(ws_message)? {
+                    match Pin::new(&mut this.ws_sink.send(res)).poll(cx) {
+                        Poll::Ready(result) => result?,
+                        Poll::Pending => todo!(),
+                    }
+                }
+            }
+
+            // Process all messages
+            while let Some(mut message) = this.message_queue.pop_front() {
+                message.handle(this.actor)
+            }
+
+            // Poll message receiver and continue to process if anything comes up
+            while let Poll::Ready(Ok(message)) =
+                Pin::new(&mut this.message_rx.recv_async()).poll(cx)
+            {
+                this.message_queue.push_back(message);
+            }
+
+            // Poll again and process new messages if any
+            match Pin::new(&mut this.message_rx.recv_async()).poll(cx) {
+                Poll::Ready(Ok(message)) => {
+                    this.message_queue.push_back(message);
+                    continue;
+                }
+                Poll::Ready(Err(_)) => {
+                    println!("Message channel closed, ungracefully stopping actor");
+                    break Poll::Ready(Err(Error::ActorChannelClosed));
+                }
+                Poll::Pending => {
+                    if !this.message_queue.is_empty() {
+                        continue;
+                    }
+                }
+            };
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
         }
     }
 }
 
 impl Runtime<WebsocketActor> for WebsocketRuntime {
-    fn start(actor: WebsocketActor) -> ActorHandle<WebsocketActor> {
-        let (tx, rx) = tokio::sync::mpsc::channel(100);
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(100);
+    fn run(actor: WebsocketActor) -> ActorHandle<WebsocketActor> {
+        let (tx, rx) = flume::unbounded();
+        let (cmd_tx, cmd_rx) = flume::unbounded();
         let rt = WebsocketRuntime::new(actor, cmd_rx, rx);
-        tokio::spawn(rt.run());
+        tokio::spawn(rt);
         ActorHandle {
             message_tx: tx,
             command_tx: cmd_tx,

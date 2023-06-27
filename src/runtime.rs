@@ -1,17 +1,21 @@
 use crate::{message::PackedMessage, Actor, ActorCommand, ActorHandle, Envelope, Error};
+use flume::Receiver;
 use futures::Future;
 use pin_project::pin_project;
-use std::{collections::VecDeque, task::Poll};
-use tokio::sync::mpsc::Receiver;
+use std::{
+    collections::VecDeque,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 pub trait Runtime<A> {
-    fn start(actor: A) -> ActorHandle<A>
+    fn run(actor: A) -> ActorHandle<A>
     where
         A: Actor + Send + 'static,
     {
-        let (tx, rx) = tokio::sync::mpsc::channel(100);
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(100);
-        let rt = DefaultActorRuntime::new(actor, cmd_rx, rx);
+        let (tx, rx) = flume::unbounded();
+        let (cmd_tx, cmd_rx) = flume::unbounded();
+        let rt = ActorRuntime::new(actor, cmd_rx, rx);
         tokio::spawn(rt);
         ActorHandle {
             message_tx: tx,
@@ -21,7 +25,7 @@ pub trait Runtime<A> {
 }
 
 #[pin_project]
-pub struct DefaultActorRuntime<A>
+pub struct ActorRuntime<A>
 where
     A: Actor,
 {
@@ -31,68 +35,67 @@ where
     message_queue: VecDeque<Envelope<A>>,
 }
 
-impl<A> Runtime<A> for DefaultActorRuntime<A> where A: Actor {}
+impl<A> Runtime<A> for ActorRuntime<A> where A: Actor {}
 
-impl<A> Future for DefaultActorRuntime<A>
+impl<A> Future for ActorRuntime<A>
 where
     A: Actor,
 {
     type Output = Result<(), Error>;
 
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
         loop {
             // Poll command receiver
-            match self.command_rx.poll_recv(cx) {
-                std::task::Poll::Ready(Some(message)) => match message {
+            match Pin::new(&mut this.command_rx.recv_async()).poll(cx) {
+                Poll::Ready(Ok(message)) => match message {
                     ActorCommand::Stop => {
                         println!("Actor stopping");
                         break Poll::Ready(Ok(())); // TODO drain the queue and all that graceful stuff
                     }
                 },
-                std::task::Poll::Ready(None) => {
+                Poll::Ready(Err(_)) => {
                     println!("Command channel closed, ungracefully stopping actor");
                     break Poll::Ready(Err(Error::ActorChannelClosed));
                 }
-                std::task::Poll::Pending => {}
+                Poll::Pending => {}
             };
 
             // Process all messages
-            while let Some(mut message) = self.message_queue.pop_front() {
-                message.handle(&mut self.actor)
+            while let Some(mut message) = this.message_queue.pop_front() {
+                message.handle(this.actor)
             }
 
             // Poll message receiver and continue to process if anything comes up
-            let mut new_messages = false;
-            while let Poll::Ready(Some(message)) = self.message_rx.poll_recv(cx) {
-                self.message_queue.push_back(message);
-                new_messages = true;
+            while let Poll::Ready(Ok(message)) =
+                Pin::new(&mut this.message_rx.recv_async()).poll(cx)
+            {
+                this.message_queue.push_back(message);
             }
 
-            match self.message_rx.poll_recv(cx) {
-                std::task::Poll::Ready(Some(message)) => {
-                    self.message_queue.push_back(message);
+            // Poll again and process new messages if any
+            match Pin::new(&mut this.message_rx.recv_async()).poll(cx) {
+                Poll::Ready(Ok(message)) => {
+                    this.message_queue.push_back(message);
                     continue;
                 }
-                std::task::Poll::Ready(None) => {
+                Poll::Ready(Err(_)) => {
                     println!("Message channel closed, ungracefully stopping actor");
                     break Poll::Ready(Err(Error::ActorChannelClosed));
                 }
-                std::task::Poll::Pending => {
-                    if new_messages {
+                Poll::Pending => {
+                    if !this.message_queue.is_empty() {
                         continue;
                     }
                 }
             };
-
-            return std::task::Poll::Pending;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
         }
     }
 }
 
-impl<A> DefaultActorRuntime<A>
+impl<A> ActorRuntime<A>
 where
     A: Actor,
 {

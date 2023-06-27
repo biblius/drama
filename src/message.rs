@@ -1,4 +1,4 @@
-use crate::{runtime::DefaultActorRuntime, Actor, Error, Handler};
+use crate::{runtime::ActorRuntime, Actor, Error, Handler};
 use tokio::sync::oneshot;
 
 /// Represents a message that can be sent to an actor. The response type is what the actor must return in its handler implementation.
@@ -79,7 +79,7 @@ where
     }
 }
 
-impl<A, M> MessagePacker<A, M> for DefaultActorRuntime<A>
+impl<A, M> MessagePacker<A, M> for ActorRuntime<A>
 where
     A: Actor + Handler<M>,
     M: Message + Send + 'static,
