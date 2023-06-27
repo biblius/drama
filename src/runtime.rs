@@ -1,4 +1,7 @@
-use crate::{message::PackedMessage, Actor, ActorCommand, ActorHandle, Envelope, Error};
+use crate::{
+    message::ActorMessage, Actor, ActorCommand, ActorHandle, Envelope, Error,
+    DEFAULT_CHANNEL_CAPACITY,
+};
 use flume::Receiver;
 use futures::Future;
 use pin_project::pin_project;
@@ -13,14 +16,10 @@ pub trait Runtime<A> {
     where
         A: Actor + Send + 'static,
     {
-        let (tx, rx) = flume::unbounded();
-        let (cmd_tx, cmd_rx) = flume::unbounded();
-        let rt = ActorRuntime::new(actor, cmd_rx, rx);
-        tokio::spawn(rt);
-        ActorHandle {
-            message_tx: tx,
-            command_tx: cmd_tx,
-        }
+        let (message_tx, message_rx) = flume::bounded(DEFAULT_CHANNEL_CAPACITY);
+        let (command_tx, command_rx) = flume::bounded(DEFAULT_CHANNEL_CAPACITY);
+        tokio::spawn(ActorRuntime::new(actor, command_rx, message_rx));
+        ActorHandle::new(message_tx, command_tx)
     }
 }
 

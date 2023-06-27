@@ -1,11 +1,5 @@
-use std::{
-    collections::VecDeque,
-    pin::Pin,
-    task::{Context, Poll},
-};
-
 use crate::{
-    message::{Envelope, PackedMessage},
+    message::{ActorMessage, Envelope},
     runtime::Runtime,
     Actor, ActorCommand, ActorHandle, Error, Handler,
 };
@@ -15,6 +9,11 @@ use futures::{
     Future, SinkExt, StreamExt,
 };
 use pin_project::pin_project;
+use std::{
+    collections::VecDeque,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use warp::ws::WebSocket;
 
 pub struct WebsocketActor {
@@ -43,13 +42,25 @@ impl WebsocketActor {
 pub struct WebsocketRuntime {
     actor: WebsocketActor,
 
+    // Pin these 2 as we are polling them directly so we know they never move
+    /// The receiving end of the websocket
+    #[pin]
     ws_stream: SplitStream<WebSocket>,
+
+    /// The sending end of the websocket
+    #[pin]
     ws_sink: SplitSink<WebSocket, warp::ws::Message>,
 
+    /// Actor message receiver
     message_rx: Receiver<Envelope<WebsocketActor>>,
+
+    /// Actor command receiver
     command_rx: Receiver<ActorCommand>,
 
+    /// Received, but not yet processed messages
     message_queue: VecDeque<Envelope<WebsocketActor>>,
+
+    /// Received, but not yet processed websocket messages
     ws_queue: VecDeque<warp::ws::Message>,
 }
 
@@ -81,7 +92,7 @@ impl Future for WebsocketRuntime {
     type Output = Result<(), Error>;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
+        let mut this = self.project();
 
         loop {
             // Poll command receiver
@@ -93,7 +104,7 @@ impl Future for WebsocketRuntime {
                     }
                 },
                 Poll::Ready(Err(_)) => {
-                    println!("Command stream dropped, ungracefully stopping actor");
+                    println!("Actor stopping"); // TODO drain the queue and all that graceful stuff
                     break Poll::Ready(Err(Error::ActorChannelClosed));
                 }
                 Poll::Pending => {}
@@ -148,6 +159,7 @@ impl Future for WebsocketRuntime {
                     }
                 }
             };
+
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }
@@ -156,14 +168,10 @@ impl Future for WebsocketRuntime {
 
 impl Runtime<WebsocketActor> for WebsocketRuntime {
     fn run(actor: WebsocketActor) -> ActorHandle<WebsocketActor> {
-        let (tx, rx) = flume::unbounded();
-        let (cmd_tx, cmd_rx) = flume::unbounded();
-        let rt = WebsocketRuntime::new(actor, cmd_rx, rx);
-        tokio::spawn(rt);
-        ActorHandle {
-            message_tx: tx,
-            command_tx: cmd_tx,
-        }
+        let (message_tx, message_rx) = flume::unbounded();
+        let (command_tx, command_rx) = flume::unbounded();
+        tokio::spawn(WebsocketRuntime::new(actor, command_rx, message_rx));
+        ActorHandle::new(message_tx, command_tx)
     }
 }
 
