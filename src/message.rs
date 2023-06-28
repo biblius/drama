@@ -67,11 +67,12 @@ where
     A: Actor + Handler<M>,
 {
     fn handle(&mut self, actor: &mut A, cx: &mut std::task::Context<'_>) -> Poll<()> {
-        let Some(message) = self.message.take() else { panic!("Message already processed") };
+        let message = self.message.take().expect("Message already processed");
         match actor.handle(message).as_mut().poll(cx) {
             Poll::Ready(result) => {
-                let Some(res_tx) = self.tx.take() else { panic!("Message already processed") };
-                let _ = res_tx.send(result.unwrap());
+                if let Some(res_tx) = self.tx.take() {
+                    let _ = res_tx.send(result.unwrap());
+                }
                 Poll::Ready(())
             }
             Poll::Pending => Poll::Pending,

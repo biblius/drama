@@ -1,13 +1,13 @@
 use crate::{
     message::{ActorMessage, Envelope},
     runtime::Runtime,
-    Actor, ActorCommand, ActorHandle, Error, Handler,
+    Actor, ActorCommand, ActorHandle, ActorStatus, Error, Handler,
 };
 use async_trait::async_trait;
 use flume::Receiver;
 use futures::{
     stream::{SplitSink, SplitStream},
-    Future, SinkExt, StreamExt,
+    Future, SinkExt, Stream, StreamExt,
 };
 use pin_project::pin_project;
 use std::{
@@ -45,6 +45,8 @@ static PROCESSED: AtomicUsize = AtomicUsize::new(0);
 #[pin_project]
 pub struct WebsocketRuntime {
     actor: WebsocketActor,
+
+    status: ActorStatus,
 
     // Pin these 2 as we are polling them directly so we know they never move
     /// The receiving end of the websocket
@@ -92,6 +94,7 @@ impl WebsocketRuntime {
             message_queue: VecDeque::new(),
             request_queue: VecDeque::new(),
             response_queue: VecDeque::new(),
+            status: ActorStatus::Starting,
         }
     }
 }
@@ -119,8 +122,7 @@ impl Future for WebsocketRuntime {
             };
 
             // Poll the websocket stream for any messages and store them to the queue
-            while let Poll::Ready(Some(ws_message)) = Pin::new(&mut this.ws_stream.next()).poll(cx)
-            {
+            while let Poll::Ready(Some(ws_message)) = this.ws_stream.as_mut().poll_next(cx) {
                 match ws_message {
                     Ok(message) => this.request_queue.push_back(message),
                     Err(e) => {

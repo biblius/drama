@@ -186,10 +186,19 @@ where
     A: Actor + Handler<M> + Enveloper<A, M> + 'static,
 {
     /// Just calls `ActorHandler::recipient`, i.e. clones the underlying channels
-    /// into the recipient.
+    /// into the recipient and boxes the message one.
     fn from(handle: ActorHandle<A>) -> Self {
         handle.recipient()
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ActorStatus {
+    Stopped = 0,
+    Starting = 1,
+    Running = 2,
+    Stopping = 3,
+    Idle = 4,
 }
 
 #[derive(Debug, thiserror::Error)]
