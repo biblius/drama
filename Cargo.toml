@@ -10,6 +10,7 @@ name = "test-ws"
 path = "tests/websocket.rs"
 
 [dependencies]
+async-trait = "0.1.68"
 flume = "0.10.14"
 futures = "0.3.28"
 pin-project = "1.1.0"

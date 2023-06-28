@@ -60,9 +60,17 @@ where
                 Poll::Pending => {}
             };
 
-            // Process all messages
-            while let Some(mut message) = this.message_queue.pop_front() {
-                message.handle(this.actor)
+            // Process all pending messages
+            let mut idx = 0;
+            while idx < this.message_queue.len() {
+                let pending = &mut this.message_queue[idx];
+                match pending.handle(this.actor, cx) {
+                    Poll::Ready(_) => {
+                        this.message_queue.swap_remove_front(idx);
+                        continue;
+                    }
+                    Poll::Pending => idx += 1,
+                }
             }
 
             // Poll message receiver and continue to process if anything comes up

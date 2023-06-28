@@ -54,9 +54,7 @@ static INDEX_HTML: &str = r#"<!DOCTYPE html>
         const ws = new WebSocket(uri);
 
         function message(data) {
-            const line = document.createElement('p');
-            line.innerText = data;
-            chat.appendChild(line);
+
         }
 
         ws.onopen = function() {
@@ -73,7 +71,11 @@ static INDEX_HTML: &str = r#"<!DOCTYPE html>
 
         send.onclick = function() {
             const msg = text.value;
-            ws.send(msg);
+            let i = 0;
+            while (i < 10000) {
+                ws.send(msg);
+                i += 1;
+            }
             text.value = '';
 
             message('<You>: ' + msg);

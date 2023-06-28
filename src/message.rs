@@ -1,3 +1,5 @@
+use std::task::Poll;
+
 use crate::{Actor, Error, Handler};
 use tokio::sync::oneshot;
 
@@ -9,7 +11,7 @@ pub trait Message {
 /// Represents a type erased message that ultimately gets stored in an [Envelope]. We need this indirection so we can abstract away the concrete message
 /// type when creating an actor handle, otherwise we would only be able to send a single message type to the actor.
 pub trait ActorMessage<A: Actor> {
-    fn handle(&mut self, actor: &mut A);
+    fn handle(&mut self, actor: &mut A, cx: &mut std::task::Context<'_>) -> Poll<()>;
 }
 
 /// Used by [ActorHandle][super::ActorHandle]s to pack [Message]s into [Envelope]s so we have a type erased message to send to the actor.
@@ -54,8 +56,8 @@ impl<A> ActorMessage<A> for Envelope<A>
 where
     A: Actor,
 {
-    fn handle(&mut self, actor: &mut A) {
-        self.message.handle(actor)
+    fn handle(&mut self, actor: &mut A, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        self.message.handle(actor, cx)
     }
 }
 
@@ -64,16 +66,16 @@ where
     M: Message,
     A: Actor + Handler<M>,
 {
-    fn handle(&mut self, actor: &mut A) {
+    fn handle(&mut self, actor: &mut A, cx: &mut std::task::Context<'_>) -> Poll<()> {
         let Some(message) = self.message.take() else { panic!("Message already processed") };
-        match actor.handle(message) {
-            Ok(result) => {
+        match actor.handle(message).as_mut().poll(cx) {
+            Poll::Ready(result) => {
                 let Some(res_tx) = self.tx.take() else { panic!("Message already processed") };
-                // TODO
-                let _ = res_tx.send(result);
+                let _ = res_tx.send(result.unwrap());
+                Poll::Ready(())
             }
-            Err(_) => todo!(),
-        };
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 

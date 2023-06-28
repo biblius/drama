@@ -3,6 +3,7 @@ use crate::{
     runtime::Runtime,
     Actor, ActorCommand, ActorHandle, Error, Handler,
 };
+use async_trait::async_trait;
 use flume::Receiver;
 use futures::{
     stream::{SplitSink, SplitStream},
@@ -12,6 +13,7 @@ use pin_project::pin_project;
 use std::{
     collections::VecDeque,
     pin::Pin,
+    sync::atomic::AtomicUsize,
     task::{Context, Poll},
 };
 use warp::ws::WebSocket;
@@ -38,6 +40,8 @@ impl WebsocketActor {
     }
 }
 
+static PROCESSED: AtomicUsize = AtomicUsize::new(0);
+
 #[pin_project]
 pub struct WebsocketRuntime {
     actor: WebsocketActor,
@@ -61,7 +65,10 @@ pub struct WebsocketRuntime {
     message_queue: VecDeque<Envelope<WebsocketActor>>,
 
     /// Received, but not yet processed websocket messages
-    ws_queue: VecDeque<warp::ws::Message>,
+    request_queue: VecDeque<warp::ws::Message>,
+
+    /// Processed websocket messages ready to be flushed in the sink
+    response_queue: VecDeque<warp::ws::Message>,
 }
 
 impl WebsocketRuntime {
@@ -83,7 +90,8 @@ impl WebsocketRuntime {
             message_rx,
             command_rx,
             message_queue: VecDeque::new(),
-            ws_queue: VecDeque::new(),
+            request_queue: VecDeque::new(),
+            response_queue: VecDeque::new(),
         }
     }
 }
@@ -114,26 +122,56 @@ impl Future for WebsocketRuntime {
             while let Poll::Ready(Some(ws_message)) = Pin::new(&mut this.ws_stream.next()).poll(cx)
             {
                 match ws_message {
-                    Ok(message) => this.ws_queue.push_back(message),
+                    Ok(message) => this.request_queue.push_back(message),
                     Err(e) => {
                         eprintln!("WS error occurred {e}")
                     }
                 }
             }
 
-            // Respond to any queued websocket messages
-            while let Some(ws_message) = this.ws_queue.pop_front() {
-                if let Some(res) = this.actor.handle(ws_message)? {
-                    match Pin::new(&mut this.ws_sink.send(res)).poll(cx) {
-                        Poll::Ready(result) => result?,
-                        Poll::Pending => todo!(),
-                    }
+            // Respond to any queued and processed websocket messages
+            let mut idx = 0;
+            while idx < this.request_queue.len() {
+                let ws_message = &this.request_queue[idx];
+                match this.actor.handle(ws_message.to_owned()).as_mut().poll(cx) {
+                    Poll::Ready(result) => match result {
+                        Ok(response) => {
+                            if let Some(response) = response {
+                                match Pin::new(&mut this.ws_sink.feed(response)).poll(cx) {
+                                    Poll::Ready(result) => {
+                                        result?;
+                                        this.request_queue.swap_remove_front(idx);
+                                        PROCESSED
+                                            .fetch_add(1, std::sync::atomic::Ordering::Acquire);
+                                    }
+                                    Poll::Pending => idx += 1,
+                                }
+                            }
+                        }
+                        Err(e) => return Poll::Ready(Err(e)),
+                    },
+                    Poll::Pending => idx += 1,
                 }
             }
 
+            println!(
+                "PROCESSED {}",
+                PROCESSED.load(std::sync::atomic::Ordering::Acquire)
+            );
+
+            let _ = Pin::new(&mut this.ws_sink.flush()).poll(cx);
+
             // Process all messages
-            while let Some(mut message) = this.message_queue.pop_front() {
-                message.handle(this.actor)
+            let mut idx = 0;
+            while idx < this.message_queue.len() {
+                let pending = &mut this.message_queue[idx];
+                match pending.handle(this.actor, cx) {
+                    Poll::Ready(_) => {
+                        this.message_queue.swap_remove_front(idx);
+                        continue;
+                    }
+                    Poll::Pending => idx += 1,
+                }
             }
 
             // Poll message receiver and continue to process if anything comes up
@@ -179,12 +217,13 @@ impl crate::Message for warp::ws::Message {
     type Response = Option<warp::ws::Message>;
 }
 
+#[async_trait]
 impl Handler<warp::ws::Message> for WebsocketActor {
-    fn handle(
+    async fn handle(
         &mut self,
         message: warp::ws::Message,
     ) -> Result<<warp::ws::Message as crate::message::Message>::Response, crate::Error> {
-        println!("Actor received message {message:?}");
+        // println!("Actor received message {message:?}");
         if message.is_text() {
             Ok(Some(message))
         } else {

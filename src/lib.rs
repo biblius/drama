@@ -1,4 +1,5 @@
 use crate::runtime::{ActorRuntime, Runtime};
+use async_trait::async_trait;
 use flume::{SendError, Sender};
 use message::{Envelope, Enveloper, Message, MessageRequest};
 use std::fmt::Debug;
@@ -21,11 +22,12 @@ pub trait Actor {
 }
 
 /// The main trait to implement on an [Actor] to enable it to handle messages.
+#[async_trait]
 pub trait Handler<M>: Actor
 where
     M: Message,
 {
-    fn handle(&mut self, message: M) -> Result<M::Response, Error>;
+    async fn handle(&mut self, message: M) -> Result<M::Response, Error>;
 }
 
 /// A handle to a spawned actor. Obtained when calling `start` on an [Actor] and is used to send messages
@@ -231,15 +233,17 @@ mod tests {
 
         impl Actor for Testor {}
 
+        #[async_trait]
         impl Handler<Foo> for Testor {
-            fn handle(&mut self, _: Foo) -> Result<usize, Error> {
+            async fn handle(&mut self, _: Foo) -> Result<usize, Error> {
                 println!("Handling Foo");
                 Ok(10)
             }
         }
 
+        #[async_trait]
         impl Handler<Bar> for Testor {
-            fn handle(&mut self, _: Bar) -> Result<isize, Error> {
+            async fn handle(&mut self, _: Bar) -> Result<isize, Error> {
                 println!("Handling Bar");
                 Ok(10)
             }
