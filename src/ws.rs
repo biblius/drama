@@ -164,17 +164,8 @@ impl Future for WebsocketRuntime {
             let _ = Pin::new(&mut this.ws_sink.flush()).poll(cx);
 
             // Process all messages
-            let mut idx = 0;
-            while idx < this.message_queue.len() {
-                let pending = &mut this.message_queue[idx];
-                match pending.handle(this.actor, cx) {
-                    Poll::Ready(_) => {
-                        this.message_queue.swap_remove_front(idx);
-                        continue;
-                    }
-                    Poll::Pending => idx += 1,
-                }
-            }
+            this.message_queue
+                .retain_mut(|message| message.handle(this.actor).as_mut().poll(cx).is_pending());
 
             // Poll message receiver and continue to process if anything comes up
             while let Poll::Ready(Ok(message)) =

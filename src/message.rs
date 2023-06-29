@@ -1,6 +1,5 @@
-use std::task::Poll;
-
 use crate::{Actor, Error, Handler};
+use async_trait::async_trait;
 use tokio::sync::oneshot;
 
 /// Represents a message that can be sent to an actor. The response type is what the actor must return in its handler implementation.
@@ -10,8 +9,9 @@ pub trait Message {
 
 /// Represents a type erased message that ultimately gets stored in an [Envelope]. We need this indirection so we can abstract away the concrete message
 /// type when creating an actor handle, otherwise we would only be able to send a single message type to the actor.
+#[async_trait(?Send)]
 pub trait ActorMessage<A: Actor> {
-    fn handle(&mut self, actor: &mut A, cx: &mut std::task::Context<'_>) -> Poll<()>;
+    async fn handle(&mut self, actor: &mut A);
 }
 
 /// Used by [ActorHandle][super::ActorHandle]s to pack [Message]s into [Envelope]s so we have a type erased message to send to the actor.
@@ -52,30 +52,27 @@ struct EnvelopeInner<M: Message> {
     tx: Option<oneshot::Sender<M::Response>>,
 }
 
+#[async_trait(?Send)]
 impl<A> ActorMessage<A> for Envelope<A>
 where
     A: Actor,
 {
-    fn handle(&mut self, actor: &mut A, cx: &mut std::task::Context<'_>) -> Poll<()> {
-        self.message.handle(actor, cx)
+    async fn handle(&mut self, actor: &mut A) {
+        self.message.handle(actor).await
     }
 }
 
+#[async_trait(?Send)]
 impl<A, M> ActorMessage<A> for EnvelopeInner<M>
 where
     M: Message,
     A: Actor + Handler<M>,
 {
-    fn handle(&mut self, actor: &mut A, cx: &mut std::task::Context<'_>) -> Poll<()> {
+    async fn handle(&mut self, actor: &mut A) {
         let message = self.message.take().expect("Message already processed");
-        match actor.handle(message).as_mut().poll(cx) {
-            Poll::Ready(result) => {
-                if let Some(res_tx) = self.tx.take() {
-                    let _ = res_tx.send(result.unwrap());
-                }
-                Poll::Ready(())
-            }
-            Poll::Pending => Poll::Pending,
+        let result = actor.handle(message).await;
+        if let Some(res_tx) = self.tx.take() {
+            let _ = res_tx.send(result.unwrap());
         }
     }
 }
@@ -104,9 +101,9 @@ impl<R> std::future::Future for MessageRequest<R> {
     ) -> std::task::Poll<Self::Output> {
         println!("Awaiting response");
         match self.as_mut().response_rx.try_recv() {
-            Ok(msg) => {
+            Ok(response) => {
                 println!("Future ready");
-                std::task::Poll::Ready(Ok(msg))
+                std::task::Poll::Ready(Ok(response))
             }
             Err(e) => {
                 println!("Future pending {e}");

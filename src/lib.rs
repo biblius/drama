@@ -60,7 +60,7 @@ where
         M: Message + Send,
         A: Handler<M> + Enveloper<A, M>,
     {
-        if self.message_tx.is_full() {
+        if self.message_tx.is_full() || self.message_tx.is_disconnected() {
             return Err(SendError(message));
         }
         let (tx, rx) = oneshot::channel();
@@ -75,7 +75,7 @@ where
         M: Message + Send + 'static,
         A: Handler<M> + Enveloper<A, M> + 'static,
     {
-        if self.message_tx.is_full() {
+        if self.message_tx.is_full() || self.message_tx.is_disconnected() {
             return Err(SendError(message));
         }
         let _ = self.message_tx.send(A::pack(message, None));
@@ -219,10 +219,12 @@ pub enum ActorCommand {
 #[cfg(test)]
 mod tests {
 
+    use std::{sync::atomic::AtomicUsize, time::Duration};
+
     use super::*;
 
     #[tokio::test]
-    async fn it_works() {
+    async fn it_works_sync() {
         #[derive(Debug)]
         struct Testor {}
 
@@ -267,11 +269,70 @@ mod tests {
             res2 += handle.send_wait(Bar {}).unwrap().await.unwrap();
         }
 
+        handle.send(Foo {}).unwrap();
+        handle.send_forget(Bar {});
+
         let rec: Recipient<Foo> = handle.recipient();
         res += rec.send_wait(Foo {}).unwrap().await.unwrap();
         handle.send_cmd(ActorCommand::Stop).unwrap();
 
         assert_eq!(res, 1010);
         assert_eq!(res2, 1000);
+    }
+
+    #[tokio::test]
+    async fn it_works_yolo() {
+        #[derive(Debug)]
+        struct Testor {}
+
+        #[derive(Debug)]
+        struct Foo {}
+
+        #[derive(Debug)]
+        struct Bar {}
+
+        impl Message for Foo {
+            type Response = usize;
+        }
+
+        impl Message for Bar {
+            type Response = isize;
+        }
+
+        impl Actor for Testor {}
+
+        static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[async_trait]
+        impl Handler<Foo> for Testor {
+            async fn handle(&mut self, _: Foo) -> Result<usize, Error> {
+                println!("INCREMENTING COUNT FOO");
+                COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(10)
+            }
+        }
+
+        #[async_trait]
+        impl Handler<Bar> for Testor {
+            async fn handle(&mut self, _: Bar) -> Result<isize, Error> {
+                println!("INCREMENTING COUNT BAR");
+                COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(10)
+            }
+        }
+
+        let handle = Testor {}.start();
+
+        handle.send_wait(Bar {}).unwrap().await.unwrap();
+        handle.send(Foo {}).unwrap();
+        handle.send_forget(Bar {});
+
+        for _ in 0..100 {
+            let _ = handle.send(Foo {});
+            handle.send_forget(Bar {});
+            tokio::time::sleep(Duration::from_micros(100)).await
+        }
+
+        assert_eq!(COUNT.load(std::sync::atomic::Ordering::Relaxed), 203);
     }
 }
