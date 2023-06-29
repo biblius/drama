@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use crate::{Actor, Error, Handler};
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
 /// Represents a message that can be sent to an actor. The response type is what the actor must return in its handler implementation.
@@ -11,7 +14,7 @@ pub trait Message {
 /// type when creating an actor handle, otherwise we would only be able to send a single message type to the actor.
 #[async_trait(?Send)]
 pub trait ActorMessage<A: Actor> {
-    async fn handle(&mut self, actor: &mut A);
+    async fn handle(&mut self, actor: Arc<Mutex<A>>);
 }
 
 /// Used by [ActorHandle][super::ActorHandle]s to pack [Message]s into [Envelope]s so we have a type erased message to send to the actor.
@@ -32,7 +35,7 @@ where
 {
     pub fn new<M>(message: M, tx: Option<oneshot::Sender<M::Response>>) -> Self
     where
-        A: Handler<M>,
+        A: Handler<M> + 'static,
         M: Message + Send + 'static,
         M::Response: Send,
     {
@@ -57,7 +60,7 @@ impl<A> ActorMessage<A> for Envelope<A>
 where
     A: Actor,
 {
-    async fn handle(&mut self, actor: &mut A) {
+    async fn handle(&mut self, actor: Arc<Mutex<A>>) {
         self.message.handle(actor).await
     }
 }
@@ -66,11 +69,11 @@ where
 impl<A, M> ActorMessage<A> for EnvelopeInner<M>
 where
     M: Message,
-    A: Actor + Handler<M>,
+    A: Actor + Handler<M> + 'static,
 {
-    async fn handle(&mut self, actor: &mut A) {
+    async fn handle(&mut self, actor: Arc<Mutex<A>>) {
         let message = self.message.take().expect("Message already processed");
-        let result = actor.handle(message).await;
+        let result = A::handle(actor, message).await;
         if let Some(res_tx) = self.tx.take() {
             let _ = res_tx.send(result.unwrap());
         }
@@ -79,7 +82,7 @@ where
 
 impl<A, M> Enveloper<A, M> for A
 where
-    A: Actor + Handler<M>,
+    A: Actor + Handler<M> + 'static,
     M: Message + Send + 'static,
     M::Response: Send,
 {

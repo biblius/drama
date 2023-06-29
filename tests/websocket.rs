@@ -1,27 +1,32 @@
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-
 use actors::ws::WebsocketActor;
 use actors::{Actor, ActorHandle};
+use std::collections::HashMap;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, RwLock};
 use warp::Filter;
 
 type Arbiter = Arc<RwLock<HashMap<usize, ActorHandle<WebsocketActor>>>>;
 
+static ID: AtomicUsize = AtomicUsize::new(0);
+
 #[tokio::main]
 async fn main() {
-    let arbiter = Arc::new(RwLock::new(HashMap::new()));
-    let arbiter = warp::any().map(move || arbiter.clone());
+    let pool = Arc::new(RwLock::new(HashMap::new()));
+    let pool = warp::any().map(move || pool.clone());
+
     // GET /chat -> websocket upgrade
     let chat = warp::path("chat")
         // The `ws()` filter will prepare Websocket handshake...
         .and(warp::ws())
-        .and(arbiter)
-        .map(|ws: warp::ws::Ws, arbiter: Arbiter| {
+        .and(pool)
+        .map(|ws: warp::ws::Ws, pool: Arbiter| {
             // This will call our function if the handshake succeeds.
             ws.on_upgrade(move |socket| {
                 let actor = WebsocketActor::new(socket);
                 let handle = actor.start();
-                arbiter.write().unwrap().insert(0, handle);
+                // let id = ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // println!("Adding actor {id}");
+                pool.write().unwrap().insert(0, handle);
                 futures::future::ready(())
             })
         });
@@ -32,7 +37,7 @@ async fn main() {
 
     let routes = index.or(chat);
 
-    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
+    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await
 }
 
 static INDEX_HTML: &str = r#"<!DOCTYPE html>
@@ -53,8 +58,10 @@ static INDEX_HTML: &str = r#"<!DOCTYPE html>
         const uri = 'ws://' + location.host + '/chat';
         const ws = new WebSocket(uri);
 
-        function message(data) {
+        let num = 0;
 
+        function message(data) {
+            if (num % 10000 === 0) chat.innerHTML = `${num}`
         }
 
         ws.onopen = function() {
@@ -63,6 +70,7 @@ static INDEX_HTML: &str = r#"<!DOCTYPE html>
 
         ws.onmessage = function(msg) {
             message(msg.data);
+            num += 1;
         };
 
         ws.onclose = function() {
@@ -72,7 +80,7 @@ static INDEX_HTML: &str = r#"<!DOCTYPE html>
         send.onclick = function() {
             const msg = text.value;
             let i = 0;
-            while (i < 10000) {
+            while (i < 100000) {
                 ws.send(msg);
                 i += 1;
             }

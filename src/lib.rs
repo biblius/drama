@@ -2,7 +2,8 @@ use crate::runtime::{ActorRuntime, Runtime};
 use async_trait::async_trait;
 use flume::{SendError, Sender};
 use message::{Envelope, Enveloper, Message, MessageRequest};
-use std::fmt::Debug;
+use parking_lot::Mutex;
+use std::{fmt::Debug, sync::Arc};
 use tokio::sync::oneshot;
 pub mod debug;
 pub mod message;
@@ -17,7 +18,7 @@ pub trait Actor {
         Self: Sized + Send + 'static,
     {
         println!("Starting actor");
-        ActorRuntime::run(self)
+        ActorRuntime::run(Arc::new(Mutex::new(self)))
     }
 }
 
@@ -27,7 +28,7 @@ pub trait Handler<M>: Actor
 where
     M: Message,
 {
-    async fn handle(&mut self, message: M) -> Result<M::Response, Error>;
+    async fn handle(this: Arc<Mutex<Self>>, message: M) -> Result<M::Response, Error>;
 }
 
 /// A handle to a spawned actor. Obtained when calling `start` on an [Actor] and is used to send messages
@@ -221,6 +222,8 @@ mod tests {
 
     use std::{sync::atomic::AtomicUsize, time::Duration};
 
+    use tokio::task::LocalSet;
+
     use super::*;
 
     #[tokio::test]
@@ -246,7 +249,7 @@ mod tests {
 
         #[async_trait]
         impl Handler<Foo> for Testor {
-            async fn handle(&mut self, _: Foo) -> Result<usize, Error> {
+            async fn handle(this: Arc<Mutex<Testor>>, _: Foo) -> Result<usize, Error> {
                 println!("Handling Foo");
                 Ok(10)
             }
@@ -254,16 +257,19 @@ mod tests {
 
         #[async_trait]
         impl Handler<Bar> for Testor {
-            async fn handle(&mut self, _: Bar) -> Result<isize, Error> {
-                println!("Handling Bar");
+            async fn handle(this: Arc<Mutex<Testor>>, _: Bar) -> Result<isize, Error> {
+                for _ in 0..10_000 {
+                    println!("Handling Bar");
+                }
                 Ok(10)
             }
         }
 
-        let handle = Testor {}.start();
-
         let mut res = 0;
         let mut res2 = 0;
+
+        let handle = Testor {}.start();
+        println!("HELLO WORLDS");
         for _ in 0..100 {
             res += handle.send_wait(Foo {}).unwrap().await.unwrap();
             res2 += handle.send_wait(Bar {}).unwrap().await.unwrap();
@@ -280,8 +286,8 @@ mod tests {
         assert_eq!(res2, 1000);
     }
 
-    #[tokio::test]
-    async fn it_works_yolo() {
+    #[test]
+    fn it_works_yolo() {
         #[derive(Debug)]
         struct Testor {}
 
@@ -305,7 +311,7 @@ mod tests {
 
         #[async_trait]
         impl Handler<Foo> for Testor {
-            async fn handle(&mut self, _: Foo) -> Result<usize, Error> {
+            async fn handle(this: Arc<Mutex<Testor>>, _: Foo) -> Result<usize, Error> {
                 println!("INCREMENTING COUNT FOO");
                 COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(10)
@@ -314,25 +320,37 @@ mod tests {
 
         #[async_trait]
         impl Handler<Bar> for Testor {
-            async fn handle(&mut self, _: Bar) -> Result<isize, Error> {
+            async fn handle(this: Arc<Mutex<Testor>>, _: Bar) -> Result<isize, Error> {
                 println!("INCREMENTING COUNT BAR");
                 COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(10)
             }
         }
 
-        let handle = Testor {}.start();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local_set = LocalSet::new();
 
-        handle.send_wait(Bar {}).unwrap().await.unwrap();
-        handle.send(Foo {}).unwrap();
-        handle.send_forget(Bar {});
+        let task = async {
+            let handle = Testor {}.start();
 
-        for _ in 0..100 {
-            let _ = handle.send(Foo {});
+            handle.send_wait(Bar {}).unwrap().await.unwrap();
+            handle.send(Foo {}).unwrap();
             handle.send_forget(Bar {});
-            tokio::time::sleep(Duration::from_micros(100)).await
-        }
 
-        assert_eq!(COUNT.load(std::sync::atomic::Ordering::Relaxed), 203);
+            for _ in 0..100 {
+                let _ = handle.send(Foo {});
+                handle.send_forget(Bar {});
+                tokio::time::sleep(Duration::from_micros(100)).await
+            }
+
+            assert_eq!(COUNT.load(std::sync::atomic::Ordering::Relaxed), 203);
+            handle.send_cmd(ActorCommand::Stop)
+        };
+
+        local_set.spawn_local(task);
+        rt.block_on(local_set)
     }
 }
