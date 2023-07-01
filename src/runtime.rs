@@ -2,21 +2,23 @@ use crate::{
     message::ActorMessage, Actor, ActorCommand, ActorHandle, Envelope, Error,
     DEFAULT_CHANNEL_CAPACITY,
 };
+use async_trait::async_trait;
 use flume::Receiver;
 use futures::Future;
-use parking_lot::Mutex;
 use pin_project::pin_project;
 use std::{
     collections::VecDeque,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
 };
+use tokio::sync::Mutex;
 
-const DEFAULT_QUEUE_CAPACITY: usize = 16;
+const QUEUE_CAPACITY: usize = 128;
 
+#[async_trait]
 pub trait Runtime<A> {
-    fn run(actor: Arc<Mutex<A>>) -> ActorHandle<A>
+    async fn run(actor: Arc<Mutex<A>>) -> ActorHandle<A>
     where
         A: Actor + Send + 'static,
     {
@@ -40,6 +42,47 @@ where
 
 impl<A> Runtime<A> for ActorRuntime<A> where A: Actor + Send + 'static {}
 
+type ActorFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+struct ActorJob<A>
+where
+    A: Actor,
+{
+    message: Option<Envelope<A>>,
+    future: Option<ActorFuture>,
+}
+
+impl<A> ActorJob<A>
+where
+    A: Actor + Send + 'static,
+{
+    fn new(message: Envelope<A>) -> Self {
+        Self {
+            message: Some(message),
+            future: None,
+        }
+    }
+
+    fn poll(
+        mut self: Pin<&mut Self>,
+        actor: Arc<Mutex<A>>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<()> {
+        match self.as_mut().message.take() {
+            Some(message) => {
+                let fut = Box::new(message).handle(actor);
+                self.future = Some(fut);
+                ready!(self.future.as_mut().unwrap().as_mut().poll(cx));
+                Poll::Ready(())
+            }
+            None => {
+                ready!(self.future.as_mut().unwrap().as_mut().poll(cx));
+                Poll::Ready(())
+            }
+        }
+    }
+}
+
 impl<A> Future for ActorRuntime<A>
 where
     A: Actor + Send + 'static,
@@ -48,60 +91,52 @@ where
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        loop {
-            // Poll command receiver
-            match Pin::new(&mut this.command_rx.recv_async()).poll(cx) {
-                Poll::Ready(Ok(message)) => match message {
-                    ActorCommand::Stop => {
-                        println!("Actor stopping");
-                        break Poll::Ready(Ok(())); // TODO drain the queue and all that graceful stuff
-                    }
-                },
-                Poll::Ready(Err(_)) => {
-                    println!("Command channel closed, ungracefully stopping actor");
-                    break Poll::Ready(Err(Error::ActorChannelClosed));
-                }
-                Poll::Pending => {}
-            };
 
-            // Process the pending futures
-            this.process_queue
-                .retain_mut(|job| job.poll(&mut this.actor.lock(), cx).is_pending());
-
-            // Poll message receiver
-            while let Poll::Ready(Ok(message)) =
-                Pin::new(&mut this.message_rx.recv_async()).poll(cx)
-            {
-                // this.process_queue.push_back(ActorJob::new(message));
-                if this.process_queue.len() >= DEFAULT_QUEUE_CAPACITY {
-                    break;
+        // Poll command receiver
+        match Pin::new(&mut this.command_rx.recv_async()).poll(cx) {
+            Poll::Ready(Ok(message)) => match message {
+                ActorCommand::Stop => {
+                    println!("Actor stopping");
+                    return Poll::Ready(Ok(())); // TODO drain the queue and all that graceful stuff
                 }
+            },
+            Poll::Ready(Err(_)) => {
+                println!("Command channel closed, ungracefully stopping actor");
+                return Poll::Ready(Err(Error::ActorChannelClosed));
             }
+            Poll::Pending => {}
+        };
 
-            // Process pending futures again after we've potentially received some
-            this.process_queue
-                .retain_mut(|job| job.poll(&mut this.actor.lock(), cx).is_pending());
+        // Process the pending futures
+        this.process_queue
+            .retain_mut(|job| Pin::new(job).poll(this.actor.clone(), cx).is_pending());
 
-            // Poll again and process new messages if any
-            match Pin::new(&mut this.message_rx.recv_async()).poll(cx) {
-                Poll::Ready(Ok(message)) => {
-                    // this.process_queue.push_back(ActorJob::new(message));
-                    continue;
-                }
-                Poll::Ready(Err(_)) => {
-                    println!("Message channel closed, ungracefully stopping actor");
-                    break Poll::Ready(Err(Error::ActorChannelClosed));
-                }
-                Poll::Pending => {
-                    if !this.process_queue.is_empty() {
-                        continue;
-                    }
-                }
-            };
-
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
+        // Poll message receiver
+        while let Poll::Ready(Ok(message)) = Pin::new(&mut this.message_rx.recv_async()).poll(cx) {
+            this.process_queue.push_back(ActorJob::new(message));
+            if this.process_queue.len() >= QUEUE_CAPACITY {
+                break;
+            }
         }
+
+        // Process pending futures again after we've potentially received some
+        this.process_queue
+            .retain_mut(|job| Pin::new(job).poll(this.actor.clone(), cx).is_pending());
+
+        // Poll again and process new messages if any
+        match Pin::new(&mut this.message_rx.recv_async()).poll(cx) {
+            Poll::Ready(Ok(message)) => {
+                this.process_queue.push_back(ActorJob::new(message));
+            }
+            Poll::Ready(Err(_)) => {
+                println!("Message channel closed, ungracefully stopping actor");
+                return Poll::Ready(Err(Error::ActorChannelClosed));
+            }
+            Poll::Pending => {}
+        };
+
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
@@ -119,52 +154,7 @@ where
             actor,
             command_rx,
             message_rx,
-            process_queue: VecDeque::with_capacity(DEFAULT_QUEUE_CAPACITY),
+            process_queue: VecDeque::with_capacity(QUEUE_CAPACITY),
         }
     }
 }
-
-pub trait ActorFuture<A>
-where
-    A: Actor,
-{
-    type Output;
-    fn poll(
-        self: Pin<&mut Self>,
-        actor: &mut A,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Self::Output>;
-}
-
-struct ActorJob<A>(pub Pin<Box<dyn ActorFuture<A, Output = ()> + Send + 'static>>);
-
-impl<A> ActorJob<A>
-where
-    A: Actor,
-{
-    fn new<F>(future: F) -> Self
-    where
-        F: ActorFuture<A, Output = ()> + Send + 'static,
-    {
-        Self(Box::pin(future))
-    }
-
-    fn poll(&mut self, actor: &mut A, cx: &mut std::task::Context<'_>) -> Poll<()> {
-        self.0.as_mut().poll(actor, cx)
-    }
-}
-
-/* impl<A> ActorFuture<A> for Envelope<A>
-where
-    A: Actor,
-{
-    type Output = ();
-
-    fn poll(
-        self: Pin<&mut Self>,
-        actor: &mut A,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Self::Output> {
-        self.get_mut().handle(actor).as_mut().poll(cx)
-    }
-} */

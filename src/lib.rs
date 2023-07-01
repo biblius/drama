@@ -2,23 +2,44 @@ use crate::runtime::{ActorRuntime, Runtime};
 use async_trait::async_trait;
 use flume::{SendError, Sender};
 use message::{Envelope, Enveloper, Message, MessageRequest};
-use parking_lot::Mutex;
 use std::{fmt::Debug, sync::Arc};
 use tokio::sync::oneshot;
+use tokio::sync::Mutex;
+
 pub mod debug;
 pub mod message;
 pub mod runtime;
 pub mod ws;
 
-const DEFAULT_CHANNEL_CAPACITY: usize = 16;
+pub struct Hello {}
 
+impl Actor for Hello {}
+
+pub struct Msg {
+    pub content: String,
+}
+impl Message for Msg {
+    type Response = usize;
+}
+
+#[async_trait]
+impl Handler<Msg> for Hello {
+    async fn handle(_: Arc<Mutex<Self>>, _: Box<Msg>) -> Result<usize, Error> {
+        println!("Handling message Hello");
+        Ok(10)
+    }
+}
+
+const DEFAULT_CHANNEL_CAPACITY: usize = 128;
+
+#[async_trait]
 pub trait Actor {
-    fn start(self) -> ActorHandle<Self>
+    async fn start(self) -> ActorHandle<Self>
     where
         Self: Sized + Send + 'static,
     {
         println!("Starting actor");
-        ActorRuntime::run(Arc::new(Mutex::new(self)))
+        ActorRuntime::run(Arc::new(Mutex::new(self))).await
     }
 }
 
@@ -28,18 +49,30 @@ pub trait Handler<M>: Actor
 where
     M: Message,
 {
-    async fn handle(this: Arc<Mutex<Self>>, message: M) -> Result<M::Response, Error>;
+    async fn handle(this: Arc<Mutex<Self>>, message: Box<M>) -> Result<M::Response, Error>;
 }
 
 /// A handle to a spawned actor. Obtained when calling `start` on an [Actor] and is used to send messages
 /// to it.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ActorHandle<A>
 where
     A: Actor,
 {
     message_tx: Sender<Envelope<A>>,
     command_tx: Sender<ActorCommand>,
+}
+
+impl<A> Clone for ActorHandle<A>
+where
+    A: Actor,
+{
+    fn clone(&self) -> Self {
+        Self {
+            message_tx: self.message_tx.clone(),
+            command_tx: self.command_tx.clone(),
+        }
+    }
 }
 
 impl<A> ActorHandle<A>
@@ -69,8 +102,8 @@ where
         Ok(MessageRequest { response_rx: rx })
     }
 
-    /// Send a message to the actor without waiting for any response, but still returning an
-    /// error if the channel is full.
+    /// Send a message to the actor without returning a response, but still returning an
+    /// error if the channel is full or disconnected.
     pub fn send<M>(&self, message: M) -> Result<(), SendError<M>>
     where
         M: Message + Send + 'static,
@@ -98,9 +131,9 @@ where
 
     pub fn recipient<M>(&self) -> Recipient<M>
     where
-        M: Message + Send + 'static,
+        M: Message + Send + 'static + Sync,
         M::Response: Send,
-        A: Handler<M> + 'static,
+        A: Handler<M> + Send + 'static,
     {
         Recipient {
             message_tx: Box::new(self.message_tx.clone()),
@@ -117,7 +150,7 @@ pub struct Recipient<M>
 where
     M: Message,
 {
-    message_tx: Box<dyn DynamicSender<M>>,
+    message_tx: Box<dyn MessageSender<M>>,
     command_tx: Sender<ActorCommand>,
 }
 
@@ -144,7 +177,7 @@ where
 
 /// A helper trait used solely by [Recipient]'s message channel to erase the actor type.
 /// This is achieved by implementing it on [Sender<Envelope<A>].
-trait DynamicSender<M>
+trait MessageSender<M>
 where
     M: Message + Send,
 {
@@ -153,7 +186,7 @@ where
     fn send(&self, message: M) -> Result<(), SendError<M>>;
 }
 
-impl<A, M> DynamicSender<M> for Sender<Envelope<A>>
+impl<A, M> MessageSender<M> for Sender<Envelope<A>>
 where
     M: Message + Send + 'static,
     M::Response: Send,
@@ -182,9 +215,9 @@ where
 
 impl<A, M> From<ActorHandle<A>> for Recipient<M>
 where
-    M: Message + Send + 'static,
+    M: Message + Send + 'static + Sync,
     M::Response: Send,
-    A: Actor + Handler<M> + Enveloper<A, M> + 'static,
+    A: Actor + Handler<M> + Enveloper<A, M> + Send + 'static,
 {
     /// Just calls `ActorHandler::recipient`, i.e. clones the underlying channels
     /// into the recipient and boxes the message one.
@@ -249,7 +282,7 @@ mod tests {
 
         #[async_trait]
         impl Handler<Foo> for Testor {
-            async fn handle(this: Arc<Mutex<Testor>>, _: Foo) -> Result<usize, Error> {
+            async fn handle(_: Arc<Mutex<Self>>, _: Box<Foo>) -> Result<usize, Error> {
                 println!("Handling Foo");
                 Ok(10)
             }
@@ -257,7 +290,7 @@ mod tests {
 
         #[async_trait]
         impl Handler<Bar> for Testor {
-            async fn handle(this: Arc<Mutex<Testor>>, _: Bar) -> Result<isize, Error> {
+            async fn handle(_: Arc<Mutex<Self>>, _: Box<Bar>) -> Result<isize, Error> {
                 for _ in 0..10_000 {
                     println!("Handling Bar");
                 }
@@ -268,7 +301,7 @@ mod tests {
         let mut res = 0;
         let mut res2 = 0;
 
-        let handle = Testor {}.start();
+        let handle = Testor {}.start().await;
         println!("HELLO WORLDS");
         for _ in 0..100 {
             res += handle.send_wait(Foo {}).unwrap().await.unwrap();
@@ -311,7 +344,7 @@ mod tests {
 
         #[async_trait]
         impl Handler<Foo> for Testor {
-            async fn handle(this: Arc<Mutex<Testor>>, _: Foo) -> Result<usize, Error> {
+            async fn handle(_: Arc<Mutex<Testor>>, _: Box<Foo>) -> Result<usize, Error> {
                 println!("INCREMENTING COUNT FOO");
                 COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(10)
@@ -320,7 +353,7 @@ mod tests {
 
         #[async_trait]
         impl Handler<Bar> for Testor {
-            async fn handle(this: Arc<Mutex<Testor>>, _: Bar) -> Result<isize, Error> {
+            async fn handle(_: Arc<Mutex<Testor>>, _: Box<Bar>) -> Result<isize, Error> {
                 println!("INCREMENTING COUNT BAR");
                 COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(10)
@@ -334,7 +367,7 @@ mod tests {
         let local_set = LocalSet::new();
 
         let task = async {
-            let handle = Testor {}.start();
+            let handle = Testor {}.start().await;
 
             handle.send_wait(Bar {}).unwrap().await.unwrap();
             handle.send(Foo {}).unwrap();

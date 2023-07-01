@@ -1,5 +1,5 @@
-use actors::ws::WebsocketActor;
-use actors::{Actor, ActorHandle};
+use drama::ws::WebsocketActor;
+use drama::{Actor, ActorHandle, Hello};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, RwLock};
@@ -14,22 +14,26 @@ async fn main() {
     let pool = Arc::new(RwLock::new(HashMap::new()));
     let pool = warp::any().map(move || pool.clone());
 
+    let hello = Hello {}.start().await;
+    let hello = warp::any().map(move || hello.clone());
     // GET /chat -> websocket upgrade
     let chat = warp::path("chat")
         // The `ws()` filter will prepare Websocket handshake...
         .and(warp::ws())
         .and(pool)
-        .map(|ws: warp::ws::Ws, pool: Arbiter| {
-            // This will call our function if the handshake succeeds.
-            ws.on_upgrade(move |socket| {
-                let actor = WebsocketActor::new(socket);
-                let handle = actor.start();
-                // let id = ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // println!("Adding actor {id}");
-                pool.write().unwrap().insert(0, handle);
-                futures::future::ready(())
-            })
-        });
+        .and(hello)
+        .map(
+            |ws: warp::ws::Ws, pool: Arbiter, hello: ActorHandle<Hello>| {
+                // This will call our function if the handshake succeeds.
+                ws.on_upgrade(|socket| async move {
+                    let actor = WebsocketActor::new(socket, hello);
+                    let handle = actor.start().await;
+                    let id = ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    println!("Adding actor {id}");
+                    pool.write().unwrap().insert(id, handle);
+                })
+            },
+        );
 
     // GET / -> index html
 
@@ -69,8 +73,8 @@ static INDEX_HTML: &str = r#"<!DOCTYPE html>
         };
 
         ws.onmessage = function(msg) {
-            message(msg.data);
             num += 1;
+            message(msg.data);
         };
 
         ws.onclose = function() {
