@@ -2,7 +2,6 @@ use crate::{
     message::ActorMessage, Actor, ActorCommand, ActorHandle, Envelope, Error,
     DEFAULT_CHANNEL_CAPACITY,
 };
-use async_trait::async_trait;
 use flume::{r#async::RecvStream, Receiver};
 use futures::{Future, StreamExt};
 use std::{
@@ -15,7 +14,6 @@ use tokio::sync::Mutex;
 
 pub const QUEUE_CAPACITY: usize = 128;
 
-#[async_trait]
 pub trait Runtime<A>
 where
     A: Actor + Send + 'static,
@@ -30,26 +28,21 @@ where
 
     fn at_capacity(&self) -> bool;
 
-    async fn run(actor: Arc<Mutex<A>>) -> ActorHandle<A> {
+    fn run(actor: A) -> ActorHandle<A> {
         let (message_tx, message_rx) = flume::bounded(DEFAULT_CHANNEL_CAPACITY);
         let (command_tx, command_rx) = flume::bounded(DEFAULT_CHANNEL_CAPACITY);
         tokio::spawn(ActorRuntime::new(actor, command_rx, message_rx));
         ActorHandle::new(message_tx, command_tx)
     }
 
-    fn process_commands(&mut self, cx: &mut Context<'_>) -> Result<(), Error> {
+    fn process_commands(&mut self, cx: &mut Context<'_>) -> Result<Option<ActorCommand>, Error> {
         match self.command_stream().poll_next_unpin(cx) {
-            Poll::Ready(Some(command)) => match command {
-                ActorCommand::Stop => {
-                    println!("Actor stopping");
-                    Ok(()) // TODO drain the queue and all that graceful stuff
-                }
-            },
+            Poll::Ready(Some(command)) => Ok(Some(command)),
             Poll::Ready(None) => {
                 println!("Command channel closed, ungracefully stopping actor");
                 Err(Error::ActorChannelClosed)
             }
-            Poll::Pending => Ok(()),
+            Poll::Pending => Ok(None),
         }
     }
 
@@ -92,12 +85,11 @@ where
     }
 }
 
-#[async_trait]
 impl<A> Runtime<A> for ActorRuntime<A>
 where
     A: Actor + Send + 'static,
 {
-    async fn run(actor: Arc<Mutex<A>>) -> ActorHandle<A> {
+    fn run(actor: A) -> ActorHandle<A> {
         let (message_tx, message_rx) = flume::bounded(DEFAULT_CHANNEL_CAPACITY);
         let (command_tx, command_rx) = flume::bounded(DEFAULT_CHANNEL_CAPACITY);
         tokio::spawn(ActorRuntime::new(actor, command_rx, message_rx));
@@ -148,13 +140,13 @@ where
     A: Actor + 'static + Send,
 {
     pub fn new(
-        actor: Arc<Mutex<A>>,
+        actor: A,
         command_rx: Receiver<ActorCommand>,
         message_rx: Receiver<Envelope<A>>,
     ) -> Self {
         println!("Building default runtime");
         Self {
-            actor,
+            actor: Arc::new(Mutex::new(actor)),
             command_stream: command_rx.into_stream(),
             message_stream: message_rx.into_stream(),
             process_queue: VecDeque::with_capacity(QUEUE_CAPACITY),

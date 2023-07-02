@@ -1,164 +1,104 @@
 use crate::{
     message::Envelope,
     runtime::{ActorJob, Runtime, QUEUE_CAPACITY},
-    Actor, ActorCommand, ActorHandle, ActorStatus, Error, Handler, Hello,
+    Actor, ActorCommand, ActorHandle, Error, Handler,
 };
-use async_trait::async_trait;
 use flume::{r#async::RecvStream, Receiver};
-use futures::{
-    stream::{SplitSink, SplitStream},
-    Future, FutureExt, SinkExt, StreamExt,
-};
+use futures::{Future, FutureExt, Sink, SinkExt, Stream, StreamExt};
 use std::{
     collections::VecDeque,
+    fmt::Display,
+    marker::PhantomData,
     pin::Pin,
     sync::atomic::AtomicUsize,
     task::{Context, Poll},
-    time::Duration,
 };
 use std::{sync::Arc, task::ready};
 use tokio::sync::Mutex;
-use warp::ws::{Message, WebSocket};
 
 const WS_QUEUE_SIZE: usize = 128;
 
-pub struct WebsocketActor {
-    websocket: Option<WebSocket>,
-    hello: ActorHandle<Hello>,
+/// Represents an actor that can get access to a websocket stream and sink.
+///
+/// A websocket actor receives messages via the stream and processes them with
+/// its [Handler] implementation. The handler implementation should always return an
+/// `Option<M>` where M is the type used when implementing this trait. A handler that returns
+/// `None` will not forward any response to the sink. If the handler returns `Some(M)` it will
+/// be forwarded to the sink.
+pub trait WsActor<M, Str, Sin>
+where
+    Str: Stream<Item = Result<M, Self::Error>>,
+    Sin: Sink<M>,
+{
+    /// The error type of the underlying websocket implementation.
+    type Error: Display;
+    fn websocket(&mut self) -> (Sin, Str);
 }
 
-impl WebsocketActor {
-    pub fn new(ws: WebSocket, handle: ActorHandle<Hello>) -> Self {
-        Self {
-            websocket: Some(ws),
-            hello: handle,
-        }
-    }
-}
-
-#[async_trait]
-impl Actor for WebsocketActor {
-    async fn start(self) -> ActorHandle<Self> {
-        WebsocketRuntime::run(Arc::new(Mutex::new(self))).await
-    }
-}
-
-type WsFuture = Pin<Box<dyn Future<Output = Result<Option<Message>, Error>> + Send>>;
-
-struct WebsocketJob {
-    message: Option<Box<Message>>,
-    future: Option<WsFuture>,
-}
-
-impl WebsocketJob {
-    pub fn new(message: Message) -> Self {
-        Self {
-            message: Some(Box::new(message)),
-            future: None,
-        }
-    }
-
-    fn poll(
-        &mut self,
-        actor: Arc<Mutex<WebsocketActor>>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Result<Option<Message>, warp::Error>> {
-        let message = self.message.take();
-
-        match message {
-            Some(message) => {
-                let fut = WebsocketActor::handle(actor, message);
-                self.future = Some(fut);
-                let result = ready!(self.future.as_mut().unwrap().as_mut().poll(cx));
-                match result {
-                    Ok(response) => Poll::Ready(Ok(response)),
-                    Err(e) => {
-                        println!("Shit's fucked son {e}");
-                        Poll::Ready(Ok(None))
-                    }
-                }
-            }
-            None => match self.future {
-                Some(ref mut fut) => match fut.as_mut().poll(cx) {
-                    Poll::Ready(result) => match result {
-                        Ok(response) => Poll::Ready(Ok(response)),
-                        Err(e) => {
-                            println!("Shit's fucked son {e}");
-                            Poll::Ready(Ok(None))
-                        }
-                    },
-                    Poll::Pending => {
-                        PENDING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                        // println!("Websocket Future pending - COUNT {PENDING:?}");
-                        Poll::Pending
-                    }
-                },
-                None => panic!("Impossibru"),
-            },
-        }
-    }
-}
-
-static PROCESSED: AtomicUsize = AtomicUsize::new(0);
-static PENDING: AtomicUsize = AtomicUsize::new(0);
-
-pub struct WebsocketRuntime {
-    actor: Arc<Mutex<WebsocketActor>>,
-
-    status: ActorStatus,
+pub struct WebsocketRuntime<A, M, Str, Sin>
+where
+    A: Actor + WsActor<M, Str, Sin> + Handler<M> + 'static,
+    Str: Stream<Item = Result<M, A::Error>>,
+    Sin: Sink<M>,
+{
+    actor: Arc<Mutex<A>>,
 
     /// The receiving end of the websocket
-    ws_stream: SplitStream<WebSocket>,
+    ws_stream: Str,
 
     /// The sending end of the websocket
-    ws_sink: SplitSink<WebSocket, Message>,
+    ws_sink: Sin,
 
     /// Actor message receiver
-    message_stream: RecvStream<'static, Envelope<WebsocketActor>>,
+    message_stream: RecvStream<'static, Envelope<A>>,
 
     /// Actor command receiver
     command_stream: RecvStream<'static, ActorCommand>,
 
     /// Actor messages currently being processed
-    process_queue: VecDeque<ActorJob<WebsocketActor>>,
+    process_queue: VecDeque<ActorJob<A>>,
 
     /// Received, but not yet processed websocket messages
-    response_queue: VecDeque<WebsocketJob>,
+    response_queue: VecDeque<WebsocketJob<A, M>>,
 }
 
-impl WebsocketRuntime {
-    pub async fn new(
-        actor: Arc<Mutex<WebsocketActor>>,
+impl<A, M, Str, Sin> WebsocketRuntime<A, M, Str, Sin>
+where
+    Str: Stream<Item = Result<M, A::Error>>,
+    Sin: Sink<M>,
+    A: Actor + WsActor<M, Str, Sin> + Send + 'static + Handler<M>,
+{
+    pub fn new(
+        mut actor: A,
         command_rx: Receiver<ActorCommand>,
-        message_rx: Receiver<Envelope<WebsocketActor>>,
+        message_rx: Receiver<Envelope<A>>,
     ) -> Self {
-        let (ws_sink, ws_stream) = actor
-            .lock()
-            .await
-            .websocket
-            .take()
-            .expect("Websocket runtime already started")
-            .split();
+        let (ws_sink, ws_stream) = actor.websocket();
 
         Self {
-            actor,
+            actor: Arc::new(Mutex::new(actor)),
             ws_sink,
             ws_stream,
             message_stream: message_rx.into_stream(),
             command_stream: command_rx.into_stream(),
             response_queue: VecDeque::new(),
             process_queue: VecDeque::new(),
-            status: ActorStatus::Starting,
         }
     }
 }
 
-impl Future for WebsocketRuntime {
+impl<A, M, Str, Sin> Future for WebsocketRuntime<A, M, Str, Sin>
+where
+    Self: Runtime<A>,
+    Str: Stream<Item = Result<M, A::Error>> + Unpin,
+    Sin: Sink<M> + Unpin,
+    A: Actor + WsActor<M, Str, Sin> + Handler<M, Response = Option<M>> + Send + Unpin + 'static,
+{
     type Output = Result<(), Error>;
 
-    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let actor = self.actor();
-        let mut this = self.as_mut();
+        let this = self.get_mut();
 
         this.process_commands(cx)?;
 
@@ -190,6 +130,7 @@ impl Future for WebsocketRuntime {
                             let mut feed = Pin::new(feed);
                             let _ = feed.as_mut().poll(cx);
                         }
+
                         PROCESSED.fetch_add(1, std::sync::atomic::Ordering::Acquire);
                         this.response_queue.swap_remove_front(idx);
                     }
@@ -209,24 +150,29 @@ impl Future for WebsocketRuntime {
             this.response_queue.len(),
         );
 
-        let _ = this.ws_sink.flush().poll_unpin(cx)?;
+        let _ = this.ws_sink.flush().poll_unpin(cx);
 
         cx.waker().wake_by_ref();
         Poll::Pending
     }
 }
 
-#[async_trait]
-impl Runtime<WebsocketActor> for WebsocketRuntime {
-    async fn run(actor: Arc<Mutex<WebsocketActor>>) -> ActorHandle<WebsocketActor> {
+impl<A, M, Str, Sin> Runtime<A> for WebsocketRuntime<A, M, Str, Sin>
+where
+    Str: Stream<Item = Result<M, A::Error>> + Unpin + Send + 'static,
+    Sin: Sink<M> + Unpin + Send + 'static,
+    A: Actor + WsActor<M, Str, Sin> + Send + 'static + Handler<M, Response = Option<M>> + Unpin,
+    M: Send + 'static,
+{
+    fn run(actor: A) -> ActorHandle<A> {
         let (message_tx, message_rx) = flume::unbounded();
         let (command_tx, command_rx) = flume::unbounded();
-        tokio::spawn(WebsocketRuntime::new(actor, command_rx, message_rx).await);
+        tokio::spawn(WebsocketRuntime::new(actor, command_rx, message_rx));
         ActorHandle::new(message_tx, command_tx)
     }
 
     #[inline]
-    fn processing_queue(&mut self) -> &mut VecDeque<ActorJob<WebsocketActor>> {
+    fn processing_queue(&mut self) -> &mut VecDeque<ActorJob<A>> {
         &mut self.process_queue
     }
 
@@ -236,12 +182,12 @@ impl Runtime<WebsocketActor> for WebsocketRuntime {
     }
 
     #[inline]
-    fn message_stream(&mut self) -> &mut RecvStream<'static, Envelope<WebsocketActor>> {
+    fn message_stream(&mut self) -> &mut RecvStream<'static, Envelope<A>> {
         &mut self.message_stream
     }
 
     #[inline]
-    fn actor(&self) -> Arc<Mutex<WebsocketActor>> {
+    fn actor(&self) -> Arc<Mutex<A>> {
         self.actor.clone()
     }
 
@@ -251,31 +197,63 @@ impl Runtime<WebsocketActor> for WebsocketRuntime {
     }
 }
 
-impl crate::Message for Message {
-    type Response = Option<Message>;
+struct WebsocketJob<A, M>
+where
+    A: Handler<M>,
+{
+    message: Option<Box<M>>,
+    future: Option<WsFuture<M, A>>,
+    __a: PhantomData<A>,
 }
 
-#[async_trait]
-impl Handler<Message> for WebsocketActor {
-    async fn handle(
-        this: Arc<Mutex<Self>>,
-        message: Box<Message>,
-    ) -> Result<<Message as crate::message::Message>::Response, crate::Error> {
-        //let mut act = this.lock().await;
-        if message.is_text() {
-            this.lock()
-                .await
-                .hello
-                .send(crate::Msg {
-                    content: message.to_str().unwrap().to_owned(),
-                })
-                .unwrap_or_else(|e| println!("{e}"));
-            //        println!("Actor retreived lock and sent message got response {res}");
-            tokio::time::sleep(Duration::from_micros(1)).await;
-            //act.wait().await;
-            Ok(Some(*message.clone()))
-        } else {
-            Ok(None)
+impl<A, M> WebsocketJob<A, M>
+where
+    A: Handler<M> + 'static,
+{
+    pub fn new(message: M) -> Self {
+        Self {
+            message: Some(Box::new(message)),
+            future: None,
+            __a: PhantomData,
+        }
+    }
+
+    fn poll(
+        &mut self,
+        actor: Arc<Mutex<A>>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<A::Response, Error>> {
+        let message = self.message.take();
+
+        match message {
+            Some(message) => {
+                let fut = A::handle(actor, message);
+                self.future = Some(fut);
+                let result = ready!(self.future.as_mut().unwrap().as_mut().poll(cx));
+                match result {
+                    Ok(response) => Poll::Ready(Ok(response)),
+                    Err(e) => {
+                        println!("Shit's fucked son {e}");
+                        Poll::Ready(Err(e))
+                    }
+                }
+            }
+            None => {
+                let Some(ref mut fut) = self.future else { panic!("Impossibru") };
+                let result = ready!(fut.as_mut().poll(cx));
+                match result {
+                    Ok(response) => Poll::Ready(Ok(response)),
+                    Err(e) => {
+                        println!("Shit's fucked son {e}");
+                        Poll::Ready(Err(e))
+                    }
+                }
+            }
         }
     }
 }
+
+type WsFuture<M, A> =
+    Pin<Box<dyn Future<Output = Result<<A as Handler<M>>::Response, Error>> + Send>>;
+
+static PROCESSED: AtomicUsize = AtomicUsize::new(0);
