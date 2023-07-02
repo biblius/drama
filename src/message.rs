@@ -41,7 +41,7 @@ where
     {
         Self {
             message: Box::new(EnvelopeInner {
-                message: Some(Box::new(message)),
+                message: Box::new(message),
                 tx,
             }),
         }
@@ -51,7 +51,7 @@ where
 /// The inner parts of the [Envelope] containing the actual message as well as an optional
 /// response channel.
 struct EnvelopeInner<M: Message> {
-    message: Option<Box<M>>,
+    message: Box<M>,
     tx: Option<oneshot::Sender<M::Response>>,
 }
 
@@ -73,8 +73,7 @@ where
     A: Actor + Handler<M> + Send + 'static,
 {
     async fn handle(self: Box<Self>, actor: Arc<Mutex<A>>) {
-        let Some(message) = self.message else { panic!("Handle already called") };
-        let result = A::handle(actor, message).await;
+        let result = A::handle(actor, self.message).await;
         if let Some(res_tx) = self.tx {
             let _ = res_tx.send(result.unwrap());
         }

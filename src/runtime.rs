@@ -3,9 +3,8 @@ use crate::{
     DEFAULT_CHANNEL_CAPACITY,
 };
 use async_trait::async_trait;
-use flume::Receiver;
-use futures::Future;
-use pin_project::pin_project;
+use flume::{r#async::RecvStream, Receiver};
+use futures::{Future, StreamExt};
 use std::{
     collections::VecDeque,
     pin::Pin,
@@ -14,37 +13,156 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-const QUEUE_CAPACITY: usize = 128;
+pub const QUEUE_CAPACITY: usize = 128;
 
 #[async_trait]
-pub trait Runtime<A> {
-    async fn run(actor: Arc<Mutex<A>>) -> ActorHandle<A>
-    where
-        A: Actor + Send + 'static,
-    {
+pub trait Runtime<A>
+where
+    A: Actor + Send + 'static,
+{
+    fn command_stream(&mut self) -> &mut RecvStream<'static, ActorCommand>;
+
+    fn message_stream(&mut self) -> &mut RecvStream<'static, Envelope<A>>;
+
+    fn processing_queue(&mut self) -> &mut VecDeque<ActorJob<A>>;
+
+    fn actor(&self) -> Arc<Mutex<A>>;
+
+    fn at_capacity(&self) -> bool;
+
+    async fn run(actor: Arc<Mutex<A>>) -> ActorHandle<A> {
         let (message_tx, message_rx) = flume::bounded(DEFAULT_CHANNEL_CAPACITY);
         let (command_tx, command_rx) = flume::bounded(DEFAULT_CHANNEL_CAPACITY);
         tokio::spawn(ActorRuntime::new(actor, command_rx, message_rx));
         ActorHandle::new(message_tx, command_tx)
     }
+
+    fn process_commands(&mut self, cx: &mut Context<'_>) -> Result<(), Error> {
+        match self.command_stream().poll_next_unpin(cx) {
+            Poll::Ready(Some(command)) => match command {
+                ActorCommand::Stop => {
+                    println!("Actor stopping");
+                    Ok(()) // TODO drain the queue and all that graceful stuff
+                }
+            },
+            Poll::Ready(None) => {
+                println!("Command channel closed, ungracefully stopping actor");
+                Err(Error::ActorChannelClosed)
+            }
+            Poll::Pending => Ok(()),
+        }
+    }
+
+    fn process_messages(&mut self, cx: &mut Context<'_>) -> Result<(), Error> {
+        let actor = self.actor();
+
+        self.processing_queue()
+            .retain_mut(|job| job.poll(actor.clone(), cx).is_pending());
+
+        // Poll message receiver
+        if !self.at_capacity() {
+            while let Poll::Ready(message) = self.message_stream().poll_next_unpin(cx) {
+                let Some(message) = message else { return Err(Error::ActorChannelClosed) };
+                self.processing_queue().push_back(ActorJob::new(message));
+                if self.at_capacity() {
+                    break;
+                }
+            }
+        }
+
+        // Process pending futures again after we've potentially received some
+        self.processing_queue()
+            .retain_mut(|job| job.poll(actor.clone(), cx).is_pending());
+
+        if self.at_capacity() {
+            return Ok(());
+        }
+
+        match self.message_stream().poll_next_unpin(cx) {
+            Poll::Ready(Some(message)) => {
+                self.processing_queue().push_back(ActorJob::new(message));
+                Ok(())
+            }
+            Poll::Ready(None) => {
+                println!("Message channel closed, ungracefully stopping actor");
+                Err(Error::ActorChannelClosed)
+            }
+            Poll::Pending => Ok(()),
+        }
+    }
 }
 
-#[pin_project]
+#[async_trait]
+impl<A> Runtime<A> for ActorRuntime<A>
+where
+    A: Actor + Send + 'static,
+{
+    async fn run(actor: Arc<Mutex<A>>) -> ActorHandle<A> {
+        let (message_tx, message_rx) = flume::bounded(DEFAULT_CHANNEL_CAPACITY);
+        let (command_tx, command_rx) = flume::bounded(DEFAULT_CHANNEL_CAPACITY);
+        tokio::spawn(ActorRuntime::new(actor, command_rx, message_rx));
+        ActorHandle::new(message_tx, command_tx)
+    }
+
+    #[inline]
+    fn processing_queue(&mut self) -> &mut VecDeque<ActorJob<A>> {
+        &mut self.process_queue
+    }
+
+    #[inline]
+    fn command_stream(&mut self) -> &mut RecvStream<'static, ActorCommand> {
+        &mut self.command_stream
+    }
+
+    #[inline]
+    fn message_stream(&mut self) -> &mut RecvStream<'static, Envelope<A>> {
+        &mut self.message_stream
+    }
+
+    #[inline]
+    fn actor(&self) -> Arc<Mutex<A>> {
+        self.actor.clone()
+    }
+
+    #[inline]
+    fn at_capacity(&self) -> bool {
+        self.process_queue.len() >= QUEUE_CAPACITY
+    }
+}
+
+/// A future representing a message currently being handled. Created when polling an [ActorJob].
+pub type ActorFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
 pub struct ActorRuntime<A>
 where
     A: Actor + Send + 'static,
 {
     actor: Arc<Mutex<A>>,
-    command_rx: Receiver<ActorCommand>,
-    message_rx: Receiver<Envelope<A>>,
+    command_stream: RecvStream<'static, ActorCommand>,
+    message_stream: RecvStream<'static, Envelope<A>>,
     process_queue: VecDeque<ActorJob<A>>,
 }
 
-impl<A> Runtime<A> for ActorRuntime<A> where A: Actor + Send + 'static {}
+impl<A> ActorRuntime<A>
+where
+    A: Actor + 'static + Send,
+{
+    pub fn new(
+        actor: Arc<Mutex<A>>,
+        command_rx: Receiver<ActorCommand>,
+        message_rx: Receiver<Envelope<A>>,
+    ) -> Self {
+        println!("Building default runtime");
+        Self {
+            actor,
+            command_stream: command_rx.into_stream(),
+            message_stream: message_rx.into_stream(),
+            process_queue: VecDeque::with_capacity(QUEUE_CAPACITY),
+        }
+    }
+}
 
-type ActorFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
-
-struct ActorJob<A>
+pub struct ActorJob<A>
 where
     A: Actor,
 {
@@ -63,12 +181,8 @@ where
         }
     }
 
-    fn poll(
-        mut self: Pin<&mut Self>,
-        actor: Arc<Mutex<A>>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<()> {
-        match self.as_mut().message.take() {
+    fn poll(&mut self, actor: Arc<Mutex<A>>, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        match self.message.take() {
             Some(message) => {
                 let fut = Box::new(message).handle(actor);
                 self.future = Some(fut);
@@ -89,72 +203,12 @@ where
 {
     type Output = Result<(), Error>;
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.as_mut();
 
-        // Poll command receiver
-        match Pin::new(&mut this.command_rx.recv_async()).poll(cx) {
-            Poll::Ready(Ok(message)) => match message {
-                ActorCommand::Stop => {
-                    println!("Actor stopping");
-                    return Poll::Ready(Ok(())); // TODO drain the queue and all that graceful stuff
-                }
-            },
-            Poll::Ready(Err(_)) => {
-                println!("Command channel closed, ungracefully stopping actor");
-                return Poll::Ready(Err(Error::ActorChannelClosed));
-            }
-            Poll::Pending => {}
-        };
-
-        // Process the pending futures
-        this.process_queue
-            .retain_mut(|job| Pin::new(job).poll(this.actor.clone(), cx).is_pending());
-
-        // Poll message receiver
-        while let Poll::Ready(Ok(message)) = Pin::new(&mut this.message_rx.recv_async()).poll(cx) {
-            this.process_queue.push_back(ActorJob::new(message));
-            if this.process_queue.len() >= QUEUE_CAPACITY {
-                break;
-            }
-        }
-
-        // Process pending futures again after we've potentially received some
-        this.process_queue
-            .retain_mut(|job| Pin::new(job).poll(this.actor.clone(), cx).is_pending());
-
-        // Poll again and process new messages if any
-        match Pin::new(&mut this.message_rx.recv_async()).poll(cx) {
-            Poll::Ready(Ok(message)) => {
-                this.process_queue.push_back(ActorJob::new(message));
-            }
-            Poll::Ready(Err(_)) => {
-                println!("Message channel closed, ungracefully stopping actor");
-                return Poll::Ready(Err(Error::ActorChannelClosed));
-            }
-            Poll::Pending => {}
-        };
-
+        this.process_commands(cx)?;
+        this.process_messages(cx)?;
         cx.waker().wake_by_ref();
         Poll::Pending
-    }
-}
-
-impl<A> ActorRuntime<A>
-where
-    A: Actor + 'static + Send,
-{
-    pub fn new(
-        actor: Arc<Mutex<A>>,
-        command_rx: Receiver<ActorCommand>,
-        message_rx: Receiver<Envelope<A>>,
-    ) -> Self {
-        println!("Building default runtime");
-        Self {
-            actor,
-            command_rx,
-            message_rx,
-            process_queue: VecDeque::with_capacity(QUEUE_CAPACITY),
-        }
     }
 }
