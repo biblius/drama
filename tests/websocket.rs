@@ -58,7 +58,7 @@ impl Handler<Message> for WebsocketActor {
             .send(crate::Msg {
                 _content: message.to_str().unwrap().to_owned(),
             })
-            .unwrap_or_else(|e| println!("{e}"));
+            .unwrap_or_else(|e| println!("FUKEN HELL M8 {e}"));
 
         Ok(Some(*message.clone()))
     }
@@ -76,7 +76,6 @@ struct Msg {
 impl Handler<Msg> for Hello {
     type Response = usize;
     async fn handle(_: Arc<Mutex<Self>>, _: Box<Msg>) -> Result<usize, Error> {
-        println!("Handling message Hello");
         Ok(10)
     }
 }
@@ -161,7 +160,7 @@ static INDEX_HTML: &str = r#"<!DOCTYPE html>
                 ws.send(msg);
                 i += 1;
             }
-            text.value = '';
+            // text.value = '';
 
             message('<You>: ' + msg);
         };

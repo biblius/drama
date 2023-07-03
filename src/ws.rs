@@ -128,10 +128,12 @@ where
                         if let Some(response) = response {
                             let feed = &mut this.ws_sink.feed(response);
                             let mut feed = Pin::new(feed);
-                            let _ = feed.as_mut().poll(cx);
+                            while feed.as_mut().poll(cx).is_pending() {
+                                // Yikes, but too dumb to figure out a better solution
+                                cx.waker().wake_by_ref();
+                            }
                         }
-
-                        PROCESSED.fetch_add(1, std::sync::atomic::Ordering::Acquire);
+                        PROCESSED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                         this.response_queue.swap_remove_front(idx);
                     }
                     Err(e) => {
@@ -141,7 +143,6 @@ where
                 Poll::Pending => idx += 1,
             }
         }
-
         this.process_messages(cx)?;
 
         println!(
@@ -202,7 +203,7 @@ where
     A: Handler<M>,
 {
     message: Option<Box<M>>,
-    future: Option<WsFuture<M, A>>,
+    future: Option<WsFuture<A, M>>,
     __a: PhantomData<A>,
 }
 
@@ -253,7 +254,7 @@ where
     }
 }
 
-type WsFuture<M, A> =
+type WsFuture<A, M> =
     Pin<Box<dyn Future<Output = Result<<A as Handler<M>>::Response, Error>> + Send>>;
 
 static PROCESSED: AtomicUsize = AtomicUsize::new(0);
