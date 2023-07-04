@@ -1,10 +1,11 @@
 //! So we don't polute the main lib with debug impls
 
-use crate::{Actor, Envelope};
+use crate::{Actor, Envelope, Handler};
 
-impl<A> std::fmt::Debug for Envelope<A>
+impl<M, A> std::fmt::Debug for Envelope<M, A>
 where
-    A: Actor,
+    A: Actor + Handler<M>,
+    M: Clone + Send,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Envelope")

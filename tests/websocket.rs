@@ -1,66 +1,41 @@
 use async_trait::async_trait;
-use drama::runtime::Runtime;
-use drama::ws::{WebsocketRuntime, WsActor};
+use drama::relay::{Relay, RelayActor};
 use drama::{Actor, ActorHandle, Error, Handler};
-use futures::stream::{SplitSink, SplitStream};
+use futures::stream::SplitStream;
 use futures::StreamExt;
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, RwLock};
-use tokio::sync::Mutex;
+use std::sync::Arc;
 use warp::ws::{Message, WebSocket};
 use warp::Filter;
 
-type Arbiter = Arc<RwLock<HashMap<usize, ActorHandle<WebsocketActor>>>>;
-
-static ID: AtomicUsize = AtomicUsize::new(0);
-
 struct WebsocketActor {
-    websocket: Option<WebSocket>,
     hello: ActorHandle<Hello>,
 }
 
 impl WebsocketActor {
-    fn new(ws: WebSocket, handle: ActorHandle<Hello>) -> Self {
-        Self {
-            websocket: Some(ws),
-            hello: handle,
-        }
+    fn new(handle: ActorHandle<Hello>) -> Self {
+        Self { hello: handle }
     }
 }
 
-impl Actor for WebsocketActor {
-    fn start(self) -> ActorHandle<Self> {
-        WebsocketRuntime::run(self)
-    }
-}
+impl Actor for WebsocketActor {}
 
-impl WsActor<Message, SplitStream<WebSocket>, SplitSink<WebSocket, Message>> for WebsocketActor {
+impl RelayActor<Message, SplitStream<WebSocket>> for WebsocketActor {
     type Error = warp::Error;
-    fn websocket(&mut self) -> (SplitSink<WebSocket, Message>, SplitStream<WebSocket>) {
-        self.websocket
-            .take()
-            .expect("Websocket already split")
-            .split()
-    }
 }
 
 #[async_trait]
-impl Handler<Message> for WebsocketActor {
-    type Response = Option<Message>;
-    async fn handle(
-        this: Arc<Mutex<Self>>,
-        message: Box<Message>,
-    ) -> Result<Self::Response, Error> {
-        this.lock()
-            .await
-            .hello
+impl Relay<Message> for WebsocketActor {
+    async fn handle(&mut self, message: Message) -> Result<Option<Message>, Error> {
+        self.hello
             .send(crate::Msg {
                 _content: message.to_str().unwrap().to_owned(),
             })
             .unwrap_or_else(|e| println!("FUKEN HELL M8 {e}"));
 
-        Ok(Some(*message.clone()))
+        Ok(Some(message))
     }
 }
 
@@ -68,6 +43,7 @@ struct Hello {}
 
 impl Actor for Hello {}
 
+#[derive(Clone)]
 struct Msg {
     pub _content: String,
 }
@@ -75,10 +51,14 @@ struct Msg {
 #[async_trait]
 impl Handler<Msg> for Hello {
     type Response = usize;
-    async fn handle(_: Arc<Mutex<Self>>, _: Box<Msg>) -> Result<usize, Error> {
+    async fn handle(&mut self, _: Msg) -> Result<usize, Error> {
         Ok(10)
     }
 }
+
+type Arbiter = Arc<RwLock<HashMap<usize, ActorHandle<WebsocketActor>>>>;
+
+static ID: AtomicUsize = AtomicUsize::new(0);
 
 #[tokio::main]
 async fn main() {
@@ -97,11 +77,15 @@ async fn main() {
             |ws: warp::ws::Ws, pool: Arbiter, hello: ActorHandle<Hello>| {
                 // This will call our function if the handshake succeeds.
                 ws.on_upgrade(|socket| async move {
-                    let actor = WebsocketActor::new(socket, hello);
-                    let handle = actor.start();
+                    let (si, st) = socket.split();
+                    let (tx, rx) = flume::unbounded();
+
+                    let actor = WebsocketActor::new(hello);
+                    let handle = actor.start_relay(st, tx);
+                    tokio::spawn(rx.into_stream().map(Ok).forward(si));
                     let id = ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     println!("Adding actor {id}");
-                    pool.write().unwrap().insert(id, handle);
+                    pool.write().insert(id, handle);
                 })
             },
         );
@@ -156,10 +140,10 @@ static INDEX_HTML: &str = r#"<!DOCTYPE html>
         send.onclick = function() {
             const msg = text.value;
             let i = 0;
-            while (i < 100000) {
+             while (i < 100000) {
                 ws.send(msg);
-                i += 1;
-            }
+                 i += 1;
+             }
             // text.value = '';
 
             message('<You>: ' + msg);

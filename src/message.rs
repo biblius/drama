@@ -1,94 +1,117 @@
-use std::sync::Arc;
-
 use crate::{Actor, Error, Handler};
 use async_trait::async_trait;
+use std::marker::PhantomData;
 use tokio::sync::oneshot;
-use tokio::sync::Mutex;
+
+#[async_trait]
+pub trait MessageHandler<A: Actor>: Send + Sync {
+    async fn handle(&mut self, actor: &mut A);
+}
+
+pub type BoxedMessageHandler<A> = Box<dyn MessageHandler<A>>;
+
+pub type MailboxReceiver<A> = flume::Receiver<BoxedMessageHandler<A>>;
+pub type MailboxSender<A> = flume::Sender<BoxedMessageHandler<A>>;
+
+pub struct ActorMailbox<M, A: Handler<M>> {
+    _phantom_actor: PhantomData<A>,
+    _phantom_msg: PhantomData<M>,
+}
 
 /// Represents a type erased message that ultimately gets stored in an [Envelope]. We need this indirection so we can abstract away the concrete message
 /// type when creating an actor handle, otherwise we would only be able to send a single message type to the actor.
-#[async_trait]
+/* #[async_trait]
 pub trait ActorMessage<A: Actor> {
-    async fn handle(self: Box<Self>, actor: Arc<Mutex<A>>);
-}
+    async fn handle(self, actor: &mut A);
+} */
 
 /// Used by [ActorHandle][super::ActorHandle]s to pack messages into [Envelope]s so we have a type erased message to send to the actor.
 pub trait Enveloper<A, M>
 where
     A: Handler<M>,
+    M: Clone + Send,
 {
     /// Wrap a message in an envelope with an optional response channel.
-    fn pack(message: M, tx: Option<oneshot::Sender<<A as Handler<M>>::Response>>) -> Envelope<A>;
+    fn pack(
+        message: M,
+        tx: Option<oneshot::Sender<<A as Handler<M>>::Response>>,
+    ) -> Box<dyn MessageHandler<A>>;
 }
 
 /// A type erased wrapper for messages. This wrapper essentially enables us to send any message to the actor
 /// so long as it implements the necessary handler.
-pub struct Envelope<A>
+pub struct Envelope<M, A>
 where
-    A: Actor,
+    A: Handler<M>,
+    M: Clone + Send + 'static,
 {
-    message: Box<dyn ActorMessage<A> + Send>,
+    message: M,
+    response_tx: Option<oneshot::Sender<A::Response>>,
 }
 
-impl<A> Envelope<A>
+impl<M, A> Envelope<M, A>
 where
-    A: Actor,
+    A: Handler<M> + Send + 'static,
+    A::Response: Send,
+    M: Clone + Send + Sync + 'static,
 {
-    pub fn new<M>(message: M, tx: Option<oneshot::Sender<A::Response>>) -> Self
-    where
-        A: Handler<M> + Send + 'static,
-        A::Response: Send,
-        M: Send + 'static,
-    {
+    pub fn new(message: M, tx: Option<oneshot::Sender<A::Response>>) -> Self {
         Self {
-            message: Box::new(EnvelopeInner {
-                message: Box::new(message),
-                tx,
-            }),
+            message,
+            response_tx: tx,
         }
     }
 }
 
 #[async_trait]
-impl<A> ActorMessage<A> for Envelope<A>
+impl<M, A> MessageHandler<A> for Envelope<M, A>
 where
-    A: Actor + Send,
+    A: Actor + Handler<M> + Send,
+    M: Clone + Send + Sync,
+    A::Response: Send,
 {
-    async fn handle(self: Box<Self>, actor: Arc<Mutex<A>>) {
-        ActorMessage::handle(self.message, actor).await
+    async fn handle(&mut self, actor: &mut A) {
+        let result = A::handle(actor, self.message.clone()).await;
+        if let Some(res_tx) = self.response_tx.take() {
+            let _ = res_tx.send(result.unwrap());
+        }
     }
 }
 
 /// The inner parts of the [Envelope] containing the actual message as well as an optional
 /// response channel.
-struct EnvelopeInner<M, R> {
-    message: Box<M>,
+/* struct EnvelopeInner<M, R> {
+    message: M,
     tx: Option<oneshot::Sender<R>>,
 }
 
 #[async_trait]
 impl<A, M> ActorMessage<A> for EnvelopeInner<M, <A as Handler<M>>::Response>
 where
-    A: Handler<M> + Send + 'static,
+    A: Handler<M>,
     A::Response: Send,
-    M: Send,
+    M: Clone + Send + Sync + 'static,
 {
-    async fn handle(self: Box<Self>, actor: Arc<Mutex<A>>) {
-        let result = A::handle(actor, self.message).await;
+    async fn handle(self, actor: &mut A) {
+        let result = A::handle(actor, self.message.clone()).await;
         if let Some(res_tx) = self.tx {
             let _ = res_tx.send(result.unwrap());
         }
     }
 }
+ */
 
 impl<A, M> Enveloper<A, M> for A
 where
     A: Handler<M> + Send + 'static,
     A::Response: Send,
-    M: Send + Sync + 'static,
+    M: Clone + Send + Sync + 'static,
 {
-    fn pack(message: M, tx: Option<oneshot::Sender<<A as Handler<M>>::Response>>) -> Envelope<A> {
-        Envelope::new(message, tx)
+    fn pack(
+        message: M,
+        tx: Option<oneshot::Sender<<A as Handler<M>>::Response>>,
+    ) -> Box<dyn MessageHandler<A>> {
+        Box::new(Envelope::new(message, tx))
     }
 }
 
