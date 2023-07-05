@@ -1,16 +1,17 @@
 use crate::{
-    message::{BoxedActorMessage, Enveloper, Handler, MailboxSender, MessageRequest},
-    runtime::ActorRuntime,
+    message::{
+        BoxedActorMessage, Enveloper, Handler, MailboxReceiver, MailboxSender, MessageRequest,
+    },
     ActorCommand,
 };
-
+use flume::Receiver;
 use flume::{SendError, Sender};
 use std::fmt::Debug;
 use tokio::sync::oneshot;
 
 pub trait Actor: Sized + Send + Sync + 'static {
     fn start(self) -> ActorHandle<Self> {
-        println!("Starting actor");
+        tracing::trace!("Starting actor");
         let (message_tx, message_rx) = flume::unbounded();
         let (command_tx, command_rx) = flume::unbounded();
         tokio::spawn(ActorRuntime::new(self, command_rx, message_rx).run());
@@ -166,5 +167,61 @@ where
     /// into the recipient and boxes the message one.
     fn from(handle: ActorHandle<A>) -> Self {
         handle.recipient()
+    }
+}
+
+/// The default actor runtime. Spins and listens for incoming commands
+/// and messages.
+struct ActorRuntime<A>
+where
+    A: Actor,
+{
+    actor: A,
+    commands: Receiver<ActorCommand>,
+    mailbox: MailboxReceiver<A>,
+}
+
+impl<A> ActorRuntime<A>
+where
+    A: Actor,
+{
+    pub fn new(
+        actor: A,
+        command_rx: Receiver<ActorCommand>,
+        message_rx: MailboxReceiver<A>,
+    ) -> Self {
+        tracing::trace!("Building default runtime");
+        Self {
+            actor,
+            commands: command_rx,
+            mailbox: message_rx,
+        }
+    }
+
+    pub async fn run(mut self) {
+        loop {
+            // Only time we error here is when we disconnect
+            tokio::select! {
+                command = self.commands.recv_async() => {
+                    let Ok(command) = command else {
+                        tracing::trace!("Actor channel disconnected, stopping");
+                        return;
+                    };
+                    match command {
+                        ActorCommand::Stop => {
+                            tracing::trace!("Actor command received, stopping");
+                            return
+                        },
+                    }
+                }
+                message = self.mailbox.recv_async() => {
+                    let Ok(mut message) = message else {
+                        tracing::trace!("Actor channel disconnected, stopping");
+                        return;
+                    };
+                    message.handle(&mut self.actor).await;
+                }
+            }
+        }
     }
 }

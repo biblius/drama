@@ -1,10 +1,13 @@
 use std::fmt::Debug;
 use tokio::sync::oneshot;
 
-pub mod actor;
-pub mod message;
-pub mod relay;
-pub mod runtime;
+mod actor;
+mod message;
+mod relay;
+
+pub use actor::{Actor, ActorHandle, Recipient};
+pub use message::Handler;
+pub use relay::{Relay, RelayActor};
 
 #[derive(Debug)]
 pub enum ActorCommand {
@@ -13,10 +16,6 @@ pub enum ActorCommand {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("Actor channel closed")]
-    ActorDisconnected,
-    #[error("Relay stream closed")]
-    RelayDisconnected,
     #[error("Channel closed: {0}")]
     ChannelClosed(#[from] oneshot::error::TryRecvError),
 }
@@ -35,7 +34,10 @@ mod tests {
     #[tokio::test]
     async fn it_works_sync() {
         #[derive(Debug)]
-        struct Testor {}
+        struct Testor {
+            foos: usize,
+            bars: isize,
+        }
 
         #[derive(Debug, Clone)]
         struct Foo {}
@@ -49,7 +51,8 @@ mod tests {
         impl Handler<Foo> for Testor {
             type Response = usize;
             async fn handle(&mut self, _: &Foo) -> usize {
-                println!("Handling Foo");
+                tracing::trace!("Handling Foo");
+                self.foos += 1;
                 10
             }
         }
@@ -58,8 +61,10 @@ mod tests {
         impl Handler<Bar> for Testor {
             type Response = isize;
             async fn handle(&mut self, _: &Bar) -> isize {
-                for _ in 0..10_000 {
-                    println!("Handling Bar");
+                tracing::trace!("Handling Bar");
+                self.bars += 1;
+                if self.foos == 100 {
+                    assert_eq!(self.bars, 100);
                 }
                 10
             }
@@ -68,8 +73,8 @@ mod tests {
         let mut res = 0;
         let mut res2 = 0;
 
-        let handle = Testor {}.start();
-        println!("HELLO WORLDS");
+        let handle = Testor { foos: 0, bars: 0 }.start();
+        tracing::trace!("HELLO WORLDS");
         for _ in 0..100 {
             res += handle.send_wait(Foo {}).await.unwrap();
             res2 += handle.send_wait(Bar {}).await.unwrap();
@@ -77,7 +82,6 @@ mod tests {
 
         handle.send(Foo {}).unwrap();
         handle.send_forget(Bar {});
-        handle.send_cmd(ActorCommand::Stop).unwrap();
 
         let rec: Recipient<Foo> = handle.recipient();
         rec.send(Foo {}).unwrap();
@@ -106,7 +110,7 @@ mod tests {
         impl Handler<Foo> for Testor {
             type Response = Result<usize, Error>;
             async fn handle(&mut self, _: &Foo) -> Result<usize, Error> {
-                println!("INCREMENTING COUNT FOO");
+                tracing::trace!("INCREMENTING COUNT FOO");
                 COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(10)
             }
@@ -116,7 +120,7 @@ mod tests {
         impl Handler<Bar> for Testor {
             type Response = Result<isize, Error>;
             async fn handle(&mut self, _: &Bar) -> Result<isize, Error> {
-                println!("INCREMENTING COUNT BAR");
+                tracing::trace!("INCREMENTING COUNT BAR");
                 COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(10)
             }

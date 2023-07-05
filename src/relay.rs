@@ -1,7 +1,7 @@
 use crate::{
     actor::{Actor, ActorHandle},
     message::MailboxReceiver,
-    ActorCommand, Error,
+    ActorCommand,
 };
 use async_trait::async_trait;
 use flume::{Receiver, Sender};
@@ -57,7 +57,7 @@ pub trait Relay<M>: Actor {
     async fn process(&mut self, message: M) -> Option<M>;
 }
 
-pub struct RelayRuntime<A, M, Str>
+struct RelayRuntime<A, M, Str>
 where
     A: RelayActor<M, Str> + Relay<M>,
     Str: Stream<Item = Result<M, A::Error>> + Unpin + Send + 'static,
@@ -103,30 +103,42 @@ where
         }
     }
 
-    pub async fn run(mut self) -> Result<(), Error> {
+    pub async fn run(mut self) {
         loop {
             // Only time we error here is when we disconnect, stream errors are just logged
             tokio::select! {
                 command = self.commands.recv_async() => {
-                    let Ok(command) = command else { return Err(Error::ActorDisconnected); };
+                    let Ok(command) = command else {
+                        tracing::trace!("Actor channel disconnected, stopping");
+                        return;
+                    };
                     match command {
                         ActorCommand::Stop => {
-                            tracing::trace!("Relay actor stopping");
-                            return Ok(())
+                            tracing::trace!("Actor command received, stopping");
+                            return;
                         },
                     }
                 }
                 message = self.mailbox.recv_async() => {
-                    let Ok(mut message) = message else { return Err(Error::ActorDisconnected); };
+                    let Ok(mut message) = message else {
+                        tracing::trace!("Actor channel disconnected, stopping");
+                        return;
+                     };
                     message.handle(&mut self.actor).await;
                 }
                 ws_msg = self.stream.next() => {
-                    let Some(ws_msg) = ws_msg else { return Err(Error::RelayDisconnected) };
+                    let Some(ws_msg) = ws_msg else {
+                        tracing::trace!("Actor stream finished, stopping");
+                        return;
+                     };
                     match ws_msg {
                         Ok(msg) => {
                             let res = self.actor.process(msg).await;
                             if let Some(res) = res {
-                                let Ok(_) = self.sender.send_async(res).await else { return Err(Error::RelayDisconnected) };
+                                let Ok(_) = self.sender.send_async(res).await else {
+                                    tracing::trace!("Actor stream finished, stopping");
+                                    return;
+                                };
                             }
                         },
                         Err(e) => {

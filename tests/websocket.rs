@@ -1,7 +1,5 @@
 use async_trait::async_trait;
-use drama::actor::{Actor, ActorHandle};
-use drama::message::Handler;
-use drama::relay::{Relay, RelayActor};
+use drama::{Actor, ActorHandle, Handler, Relay, RelayActor};
 use flume::Sender;
 use futures::stream::SplitStream;
 use futures::StreamExt;
@@ -36,7 +34,7 @@ impl Relay<Message> for WebsocketActor {
             .send(crate::Msg {
                 _content: message.to_str().unwrap().to_owned(),
             })
-            .unwrap_or_else(|e| println!("FUKEN HELL M8 {e}"));
+            .unwrap_or_else(|e| tracing::trace!("FUKEN HELL M8 {e}"));
         self.tx.send(message.clone()).unwrap();
         Some(message)
     }
@@ -87,7 +85,7 @@ async fn main() {
                     let handle = actor.start_relay(st, tx);
                     tokio::spawn(rx.into_stream().map(Ok).forward(si));
                     let id = ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    println!("Adding actor {id}");
+                    tracing::trace!("Adding actor {id}");
                     pool.write().insert(id, handle);
                 })
             },
@@ -143,7 +141,7 @@ static INDEX_HTML: &str = r#"<!DOCTYPE html>
         send.onclick = function() {
             const msg = text.value;
             let i = 0;
-             while (i < 100000) {
+             while (i < 10000) {
                 ws.send(msg);
                  i += 1;
              }
