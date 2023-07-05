@@ -1,21 +1,20 @@
-use crate::{message::MailboxReceiver, Actor, ActorCommand};
-use flume::{r#async::RecvStream, Receiver};
-use futures::StreamExt;
+use crate::{actor::Actor, message::MailboxReceiver, ActorCommand, Error};
+use flume::Receiver;
 
-pub const QUEUE_CAPACITY: usize = 128;
-
+/// The default actor runtime. Spins and listens for incoming commands
+/// and messages.
 pub struct ActorRuntime<A>
 where
-    A: Actor + Send + 'static,
+    A: Actor,
 {
     actor: A,
-    command_stream: RecvStream<'static, ActorCommand>,
+    commands: Receiver<ActorCommand>,
     mailbox: MailboxReceiver<A>,
 }
 
 impl<A> ActorRuntime<A>
 where
-    A: Actor + 'static + Send,
+    A: Actor,
 {
     pub fn new(
         actor: A,
@@ -25,31 +24,29 @@ where
         println!("Building default runtime");
         Self {
             actor,
-            command_stream: command_rx.into_stream(),
+            commands: command_rx,
             mailbox: message_rx,
         }
     }
 
-    pub async fn runt(mut self) {
+    pub async fn run(mut self) -> Result<(), Error> {
         loop {
+            // Only time we error here is when we disconnect
             tokio::select! {
-                Some(command) = self.command_stream.next() => {
-                   match command {
-                            ActorCommand::Stop => {
-                                println!("actor stopping");
-                                return
-                            },
-                        }
+                command = self.commands.recv_async() => {
+                    let Ok(command) = command else { return Err(Error::ActorDisconnected); };
+                    match command {
+                        ActorCommand::Stop => {
+                            tracing::trace!("Relay actor stopping");
+                            return Ok(())
+                        },
+                    }
                 }
                 message = self.mailbox.recv_async() => {
-                    if let Ok(mut message) = message {
-                        message.handle(&mut self.actor).await
-                    } else {
-                         break;
-                     }
+                    let Ok(mut message) = message else { return Err(Error::ActorDisconnected); };
+                    message.handle(&mut self.actor).await;
                 }
             }
         }
-        println!("actor stopping");
     }
 }

@@ -1,6 +1,8 @@
 use async_trait::async_trait;
+use drama::actor::{Actor, ActorHandle};
+use drama::message::Handler;
 use drama::relay::{Relay, RelayActor};
-use drama::{Actor, ActorHandle, Error, Handler};
+use flume::Sender;
 use futures::stream::SplitStream;
 use futures::StreamExt;
 use parking_lot::RwLock;
@@ -12,11 +14,12 @@ use warp::Filter;
 
 struct WebsocketActor {
     hello: ActorHandle<Hello>,
+    tx: Sender<Message>,
 }
 
 impl WebsocketActor {
-    fn new(handle: ActorHandle<Hello>) -> Self {
-        Self { hello: handle }
+    fn new(handle: ActorHandle<Hello>, tx: Sender<Message>) -> Self {
+        Self { hello: handle, tx }
     }
 }
 
@@ -28,14 +31,14 @@ impl RelayActor<Message, SplitStream<WebSocket>> for WebsocketActor {
 
 #[async_trait]
 impl Relay<Message> for WebsocketActor {
-    async fn handle(&mut self, message: Message) -> Result<Option<Message>, Error> {
+    async fn process(&mut self, message: Message) -> Option<Message> {
         self.hello
             .send(crate::Msg {
                 _content: message.to_str().unwrap().to_owned(),
             })
             .unwrap_or_else(|e| println!("FUKEN HELL M8 {e}"));
-
-        Ok(Some(message))
+        self.tx.send(message.clone()).unwrap();
+        Some(message)
     }
 }
 
@@ -51,8 +54,8 @@ struct Msg {
 #[async_trait]
 impl Handler<Msg> for Hello {
     type Response = usize;
-    async fn handle(&mut self, _: Msg) -> Result<usize, Error> {
-        Ok(10)
+    async fn handle(&mut self, _: &Msg) -> usize {
+        10
     }
 }
 
@@ -80,7 +83,7 @@ async fn main() {
                     let (si, st) = socket.split();
                     let (tx, rx) = flume::unbounded();
 
-                    let actor = WebsocketActor::new(hello);
+                    let actor = WebsocketActor::new(hello, tx.clone());
                     let handle = actor.start_relay(st, tx);
                     tokio::spawn(rx.into_stream().map(Ok).forward(si));
                     let id = ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
